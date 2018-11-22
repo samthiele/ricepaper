@@ -66,7 +66,7 @@ def gridNodeData(graph, nodes, pos, quantity, cellsize,dynamic=True):
         components = []
         for c in d.T: #loop through each component
             components.append(bin2d(p[0],p[1],c,bins=[nx,ny]).statistic) #grid component
-        return np.dstack(components) #return as vector field in the format grid[x,y,component]
+        return components #return list of vector fields
     elif len(d.shape) == 3: #tensor property (probably stress)
         #what to do here?
         return []
@@ -86,7 +86,7 @@ def gridModel( model, quantity, cellsize, dynamic=True):
         stack = []
         for q in quantity:
             stack.append(gridNodeData( model.G, model.G.nodes, model.pos, q, cellsize, dynamic ))
-        return np.dstack(stack) #return stacked list.
+        return stack #list of lists.
 
 """
 Quickly plot a grid dataset using matplotlib
@@ -111,7 +111,7 @@ Quickly(ish) plot a quiver plot of a vector field.
 **Arguments**:
 -grid = the vector field grid as returned by gridNodeData(...). Should be of the form [x,y,c] where c are the vector components and x,y are the position grid coords.
 -normed = True if vectors are normalized befeore plotting. This will only plot vector directions and ignore magnitude. Default is True.
--cmap = the colour map to plot the stress magnitude with. Default is "plasma". If None, colours are not used.
+-cmap = the colour map to plot the vector magnitude with. Default is "plasma". If None, colours are not used.
 -figsize = the size of the figure/plot created. Defautl is (18,5).
 -hold = if set to True, the plot is not shown so it can be modified by future pyplot commands.
 **Keywords**:
@@ -124,8 +124,8 @@ def quickPlotV( grid, normed=True, cmap="plasma", figsize=(18,5),hold=False,**kw
     u = grid[:,:,0].ravel()
     v = grid[:,:,1].ravel()
 
+    l = np.sqrt( u**2 + v**2 )
     if normed:
-        l = np.sqrt( u**2 + v**2 )
         u /= l
         v /= l
     
@@ -147,4 +147,8 @@ def quickPlotV( grid, normed=True, cmap="plasma", figsize=(18,5),hold=False,**kw
         cmap = plt.get_cmap(cmap)
         norm = mpl.colors.Normalize(vmin=min(l),vmax=max(l))
         plt.quiver(X.ravel(),Y.ravel(),u,v,color=cmap(norm(l)),**kwds)
-        
+
+        #and color bar
+        sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array(l)
+        plt.colorbar(sm)

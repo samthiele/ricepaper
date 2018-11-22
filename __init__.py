@@ -37,6 +37,7 @@ class RicePaper:
         self.step = 0 #index for counting timesteps
         self.file = 0 #index for counting files created
         self.restart=None
+        self.history = [] #list of all commands that lead to this model (rather than just from the last execute)
     def getAllLines(self):
         out = []
         out.append(self._startLines()) #write start lines
@@ -72,6 +73,12 @@ class RicePaper:
         #get lines
         lines = self.getAllLines()
         
+        #update history
+        if len(self.history) == 0:
+            self.history += lines #include start lines
+        else: #this is a restart - just include new lines
+            self.history += self.lines
+
         #add trailing lines
         if (saveState):
             lines.append("SAVE state_%d.sav\n" % self.file)
@@ -136,6 +143,7 @@ class RicePaper:
         clone.step = self.step
         clone.file = self.file
         clone.restart = self.restart
+        clone.history = list(self.history)
         
         if not clone.restart is None:
             #create new directory and copy across restart file
@@ -152,7 +160,7 @@ class RicePaper:
     def loadLastOutput(self):
         cwd = os.getcwd()
         os.chdir(self.dir) #move into output dir
-        fname = "Out%d.out" % self.file
+        fname = "Step%03d.out" % self.file
         assert os.path.exists(fname), "Error: no ouput file %s found" % fname
         model = RiceBall(fname,radii=self.radii)
         os.chdir(cwd)
@@ -173,7 +181,7 @@ class RicePaper:
         os.chdir(self.dir) #move into output dir
         
         for s in steps:
-            fname = "Out%d.out" % s
+            fname = "Step%03d.out" % s
             assert os.path.exists(fname), "Error: no ouput file %s found" % fname
             out.append(RiceBall(fname,radii=self.radii))
         os.chdir(cwd)
@@ -238,8 +246,8 @@ class RicePaper:
     def setRadius(self, index, value ):
         _validateIdx(index)
         self.radii[index] = value
-        self.lines.append(self._defineRadii()) #push to buffer
-    
+        #self.lines.append(self._defineRadii()) #push to buffer
+        self.lines.append("RAD %.2f %d\n" % (value, index))
     """
     Define particle density.
     
@@ -250,8 +258,8 @@ class RicePaper:
     def setDensity(self, index, density ):
         _validateIdx(index)
         self.density[index] = density
-        self.lines.append(self._defineDensity()) #push to buffer
-    
+        #self.lines.append(self._defineDensity()) #push to buffer
+        self.lines.append("DENS %d %d\n" % (density,index))
     """
     Define hertzian material properties
     
@@ -263,8 +271,8 @@ class RicePaper:
     def setHertzian(self, index, shearModulus, poisson ):
         _validateIdx(index)
         self.hertz[index] = (shearModulus,poisson)
-        self.lines.append(self._defineHertzProperties()) #push to buffer
-        
+        #self.lines.append(self._defineHertzProperties()) #push to buffer
+        self.lines.append("HERTZ %E %f %d\n" % (shearModulus,poisson,index))
     """
     Set the linear interaction properties between particle types (if used).
     
@@ -427,7 +435,7 @@ class RicePaper:
         
         if not isinstance(color,int):
             color = 0
-            
+        
         self.lines.append("GEN %d %d %d %d\n" % (nballs,shape_class,surface_class,color))
     
     """
@@ -442,14 +450,25 @@ class RicePaper:
     -the stepID for this cycle. These can be used for retrieving output (if output has been saved). 
     """
     def cycle(self, ncycles, storeOutput=True, createFig = False):
-        self.lines.append("C %d\n" % ncycles)
+        #increment trackers of number of steps/number of cycle calls
         self.step += ncycles
         self.file += 1
         
+        #open new bondfile
         if storeOutput:
-            self.lines.append("PR Out%d.out G I S B C\n" % self.file)
+            self.lines.append("BFIL 1 Step%03d.bnd\n" % self.file)
+        
+        #actual cycle command
+        self.lines.append("C %d\n" % ncycles)
+        
+        #store output?
+        if storeOutput:
+            self.lines.append("BFIL 0\n") #close bond file
+            self.lines.append("PR Step%03d.out G I S B C\n" % self.file)
         if createFig:
-            self.lines.append("PL Fig%d.ps BO D\n" % self.file)
+            self.lines.append("PL Step%03d_B.ps BO D\n" % self.file)
+            self.lines.append("PL Step%03d_F.ps BO F\n" % self.file)
+            self.lines.append("PL Step%03d_D.ps BO RDIS\n" % self.file)
             
         return self.file
     
@@ -507,11 +526,72 @@ class RicePaper:
     def custom(self, command):
         self.lines.append("%s\n" % command)
             
+    """
+    Write a trubalw.dat file that can recreate the most recently executed model without using any stochastic functions. This can help avoid issues associated
+    with different random seed procedures on machines with different compilers. Note that this is a fairly crude hack... so may not perfectly reproduce models.
+    Also note that some features (such as bonds) will not be reproduced!
+    """
+    def dumpState(self, file = 'trubalw.dat'):
+        model = self.loadLastOutput() #load last state
+        
+        #get all executed lines, but remove any gen commands
+        lines = []
+        for l in self.history:
+            if not "GEN" in l and not "LIN" in l and not "CR" in l: #not a command that generates balls
+                cmd = l.split(" ")[0]
+                if not cmd == "C" and not cmd == "PL" and not cmd == "PR" and not "BFIL " in l: #ignore cycle commands and output commands
+                    lines.append(l)
+        
+        #loop through and create nodes
+        for N in model.G.nodes:
+            #get data
+            x,y,z = float(model.G.nodes[N]['U.x']),float(model.G.nodes[N]['U.y']),float(model.G.nodes[N]['U.z']) #postion
+            sType = int(model.G.nodes[N]['STYPE']) #size type
+            mType = int(model.G.nodes[N]['MTYPE']) #material type
+            lines.append("CReate %f %f %f %d %d\n" % (x,y,z,sType,mType)) #create this particle 
+        #
+        #lines.append("C 1") #this seems to be needed for us to then change particle properties
+        #assign properties
+        #for N in model.G.nodes:
+            x,y,z = float(model.G.nodes[N]['U.x']),float(model.G.nodes[N]['U.y']),float(model.G.nodes[N]['U.z']) #postion
+            vx,vy,vz = float(model.G.nodes[N]['UDOT.x']),float(model.G.nodes[N]['UDOT.y']),float(model.G.nodes[N]['UDOT.z']) #velocity
+            tx,ty,tz = float(model.G.nodes[N]['THETA.x']),float(model.G.nodes[N]['THETA.y']),float(model.G.nodes[N]['THETA.z']) #rotation
+            dtx,dty,dtz = float(model.G.nodes[N]['TDOT.x']),float(model.G.nodes[N]['TDOT.y']),float(model.G.nodes[N]['TDOT.z']) #angular velocity
+            c = int(model.G.nodes[N]['COL']) #color
+            dofT = model.G.nodes[N]['TFIXED'] #translation DOF
+            dofR = model.G.nodes[N]['RFIXED'] #rotation DOF
 
-
-
+            #and set its properties
+            e = 0.5
+            #lines.append("DOM %f %f %f %f %f %f\n" % (x-e,x+e,y-e,y+e,z-e,z+e))
+            lines.append("POLy 1 %d %d %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n" % (0,100,
+                                                                            x-e,y-e,
+                                                                            x-e,y+e,
+                                                                            x+e,y+e,
+                                                                            x+e,y-e))
+            lines.append("PRP 1 COL x %d\n" % c) #set color
+            lines.append("PRP 1 VEL %f %f %f\n" % (vx,vy,vz)) #set velocity
+            lines.append("PRP 1 FIX %s %s %s %s %s %s\n" % (dofT[0],dofT[1],dofT[2], #fix DOFs
+                                                          dofR[0],dofR[1],dofR[2]))
+            #lines.append("PRP 1 FIX 1 1 1 1 1 1\n")
+            #TODO - set particle rotations and angular velocities??
+        
+        #add any outstanding lines (note - we assume no further GEN commands here!)
+        lines += self.lines
+        
+        #add trailing lines
+        lines.append("c 1\n") #not sure if this is needed, but cycle breifly to (possibly) apply changes
+        lines.append("SAVE state_%d.sav\n" % self.file) #save the file state - so that following analyses can pick up on the output!
+        lines.append("stop\n")
+        
+        #write file
+        f = open(file,'w')
+        f.writelines(lines)
+        f.close()
+        
+    
+    
 #   "Private" functions for writing properties in this class to definition files. These should not be called from outside this class...
-
 
     """
     Create header lines for a new (as opposed to re-loaded) simulation.
@@ -550,7 +630,6 @@ class RicePaper:
             line+= "HERTZ %E %f %d\n" % (value[0],value[1],key)
         return line
  
-
 """
 Quick and dirty multithreading tool for executing multiple riceball projects at once.
 
@@ -562,7 +641,7 @@ Quick and dirty multithreading tool for executing multiple riceball projects at 
                This is useful if the model files have already been generated and you want to 
                fool ricepaper into thinking they have been freshly minted. 
 """
-def multiThreadExecute( projects,saveState=True,verbose=True,supress=False):
+def multiThreadExecute( projects,saveState=True,verbose=True,suppress=False):
     import multiprocessing
     from threading import Thread
     from time import sleep
@@ -573,7 +652,7 @@ def multiThreadExecute( projects,saveState=True,verbose=True,supress=False):
     while not (len(waiting) == 0 and len(active) == 0): #While there are jobs still to run/running?
         if len(active) < nCores and len(waiting) > 0: #are there free cores? Jobs still to run?
             job=waiting.pop() #get next job (n.b. this automatically removes it from the set)
-            T = Thread(target=job.execute,args=(saveState,False,None,supress)) #create thread for next job #args = saveState=True,returnLog=False,restart=None,suppress=False
+            T = Thread(target=job.execute,args=(saveState,False,None,suppress)) #create thread for next job #args = saveState=True,returnLog=False,restart=None,suppress=False
             T.start() #spawn thread
             active.add(T) #add to active thread list
             
@@ -600,4 +679,4 @@ Util function for asserting that an index is valid.
 """
 def _validateIdx(index):
     assert isinstance(index,int), "index must be an integer."
-    assert index >= 1, "Index must be >= 1."
+    assert index >= 1, "Index must be >= 1"

@@ -147,8 +147,24 @@ class RiceBall:
             
             #add edge
             self.G.add_edge(int(attributes["BALL1"]),int(attributes["BALL2"]),**attributes)
-    
-            #calculate magnintude of shear stres
+            
+            #calculate magnintude of shear stress?
+            
+            
+        #is there associated bond breakage data?
+        bfile = os.path.splitext(file)[0] + ".bnd"
+        if os.path.isfile(bfile):
+            self.brk = [] #store breakage data such that each row corresponds to a breakage event
+            f = open(bfile,"r")
+            lines = f.readlines()
+            header = getHeader(lines[0])
+            for l in lines[1:]: #first line is header: Action  Cycle  Styp1  Styp2  Rad1  Rad2  x1  y1  z1      x2  y2  z2  Fn  Fs  Fsmax
+                data = splitLine(l)
+                data[1] = "%s %s" % (data[0],data[1]) #concatenate first two lines
+                #store data
+                self.brk.append(data[1:]) #store
+
+        
     """
     Returns the number of balls in this model step 
     """
@@ -190,20 +206,33 @@ class RiceBall:
             
             #loop through edges
             for e in edges:
-                #compute branch vector (the direction joining this particle to its neighbours)
-                branch = np.array([float(self.G.nodes[e[1]]["U.x"]),
+                #compute contact normal vector (the normal vector of this contact and the direction joining this particle to the contacting neighbour)
+                cN = np.array([float(self.G.nodes[e[1]]["U.x"]),
                                    float(self.G.nodes[e[1]]["U.y"]),
                                    float(self.G.nodes[e[1]]["U.z"])])
-                branch -= np.array([float(self.G.nodes[e[0]]["U.x"]),
+                cN -= np.array([float(self.G.nodes[e[0]]["U.x"]),
                                    float(self.G.nodes[e[0]]["U.y"]),
                                    float(self.G.nodes[e[0]]["U.z"])])
-                branch = branch / np.linalg.norm(branch)
+                cN = cN / np.linalg.norm(cN) #normalise to unit vector
                 
-                #get force vector
-                force = branch*float(e[2]["FN"])+np.array([float(e[2]["FS.x"]),float(e[2]["FS.y"]),float(e[2]["FS.z"])])
+                #calculate branch vector (normal vector * the particle radius)
+                branch = np.array(cN) #be sure to copy data rather than pointer!
+                if not self.radii is None: #are radii defined?
+                    branch *= self.radii[N] #multiply contact normal by particle radius
+                
+                #get normal and shear force components from model
+                sF = np.array([float(e[2]["FS.x"]),float(e[2]["FS.y"]),float(e[2]["FS.z"])]) #shear force
+                nF = cN*float(e[2]["FN"]) #normal force
+                
+                #check normal and shear components are perpendicular...
+                assert np.abs(np.dot(sF/np.linalg.norm(sF),nF/np.linalg.norm(nF))) < 1e-7, "Fn [%e,%e,%e] and Fs [%e,%e,%e] not perpendicular (dot=%e) !?!" % (nF[0],nF[1],nF[2],sF[0],sF[1],sF[2],np.dot(sF,nF))
+                
+                #resolve combined force
+                force = nF + sF
                 
                 #add to stress tensor as per:
                 #Sij = 1 / volume * Sum(force_i * branch_j)
+                #N.B. THIS ASSUMES A STATIC MODEL - MOVING PARTICLES WILL RESULT IN NON-SYMETTRIC STRESS TENSORS?
                 stress[0,0] += force[0] * branch[0]
                 stress[0,1] += force[0] * branch[1]
                 stress[0,2] += force[0] * branch[2]
@@ -216,9 +245,12 @@ class RiceBall:
             
             #normalise to node volume (TODO - replace ball volume with veroni cell volume)
             V = 1
-            if self.radii != None:
+            if not self.radii is None:
                 V = 4./3. * np.pi * self.radii[N]**3
             stress = stress / V
+            
+            if (stress[0,0] > 1000):
+                print(np.abs((stress[1,0] - stress[0,1]))/((stress[1,0] + stress[0,1])*0.5))
             
             #store stress tensor
             S[N] = stress

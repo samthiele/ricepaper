@@ -148,6 +148,10 @@ class DykeFarm:
                 penalised in the routing algorithm. If false, the shortest path
                 between the start position and end postion (as defined by the dip)
                 is used. Default is False.
+                
+    **Returns**:
+    -dykes = a list of node IDs of the nodes in the dykes
+    -bonds = a list of tuples containing pairs of nodes joined by dyke segments
     """
     def dykeFromOri(self, startx, dip, useCost = False):
         assert abs(dip) <= 90, "Error: invalid dip (%f) when generating dyke." % dip
@@ -205,12 +209,20 @@ class DykeFarm:
         except: #could not route dyke
             print("Warning: could not route dyke between %d and %d. Dyke ignored." % (n,end))
         
-        #simulate dyke arrest and change dyke color
+        #simulate dyke arrest and change dyke color and extract "bonds"
+        bonds = []
         for i,n in enumerate(path):
+            #change color
             self.model.G.nodes[n]["COL"] = "3"
+            
+            #build bond
+            if i > 0:
+                bonds.append( (path[i-1],path[i]) )
+            
+            #arrest dyke here?
             if np.random.rand() < self.p_arrest:
-                return path[0:i]
+                return path[0:i],bonds
                 
         #return dyke
-        return path
+        return path, bonds
         
