@@ -3,3 +3,5 @@
 .pvsm
 .dat
 .vtu
+_sandbox
+__pycache__

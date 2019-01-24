@@ -145,6 +145,7 @@ class RiceBall:
             #add attribute describing magnitude of shear stress
             attributes["Fs"] = np.linalg.norm( np.array( [float(attributes["FS.x"]),float(attributes["FS.y"])]))
             
+            
             #add edge
             self.G.add_edge(int(attributes["BALL1"]),int(attributes["BALL2"]),**attributes)
             
@@ -204,35 +205,50 @@ class RiceBall:
             #initialise null stress tensor
             stress = np.zeros([3,3])
             
+            #we also compute the vector sum of the forces - if they don't add to zero the stress tensor will be wrong!
+            nsum = np.zeros(3) #normal-force sum
+            tsum = np.zeros(3) #torque sum 
             #loop through edges
             for e in edges:
+                #get normal and shear force components from model
+                sF = np.array([float(e[2]["FS.x"]),float(e[2]["FS.y"]),float(e[2]["FS.z"])]) #shear force
+                nF = float(e[2]["FN"]) #normal force
+                
                 #compute contact normal vector (the normal vector of this contact and the direction joining this particle to the contacting neighbour)
-                cN = np.array([float(self.G.nodes[e[1]]["U.x"]),
-                                   float(self.G.nodes[e[1]]["U.y"]),
-                                   float(self.G.nodes[e[1]]["U.z"])])
-                cN -= np.array([float(self.G.nodes[e[0]]["U.x"]),
-                                   float(self.G.nodes[e[0]]["U.y"]),
-                                   float(self.G.nodes[e[0]]["U.z"])])
-                cN = cN / np.linalg.norm(cN) #normalise to unit vector
+                #cN = np.array([float(self.G.nodes[e[1]]["U.x"]),
+                #                   float(self.G.nodes[e[1]]["U.y"]),
+                #                   float(self.G.nodes[e[1]]["U.z"])])
+                #cN -= np.array([float(self.G.nodes[e[0]]["U.x"]),
+                #                   float(self.G.nodes[e[0]]["U.y"]),
+                #                   float(self.G.nodes[e[0]]["U.z"])])
+                #cN = cN / np.linalg.norm(cN) #normalise to unit vector
+                #nn = cN
+                
+                #cN is perpendicular to sF - calculate using cross product
+                #N.B. ONLY WORKS IN 2D! (i.e. when the z-component of all vectors is 0)
+                cN = np.cross( sF / np.linalg.norm(sF), np.array([0,0,1]))
+                cN = cN / np.linalg.norm(cN)
+                
+                #transform nF into vector by multiplying with contact normal
+                nF = nF * cN
                 
                 #calculate branch vector (normal vector * the particle radius)
                 branch = np.array(cN) #be sure to copy data rather than pointer!
                 if not self.radii is None: #are radii defined?
                     branch *= self.radii[N] #multiply contact normal by particle radius
                 
-                #get normal and shear force components from model
-                sF = np.array([float(e[2]["FS.x"]),float(e[2]["FS.y"]),float(e[2]["FS.z"])]) #shear force
-                nF = cN*float(e[2]["FN"]) #normal force
-                
-                #check normal and shear components are perpendicular...
-                assert np.abs(np.dot(sF/np.linalg.norm(sF),nF/np.linalg.norm(nF))) < 1e-7, "Fn [%e,%e,%e] and Fs [%e,%e,%e] not perpendicular (dot=%e) !?!" % (nF[0],nF[1],nF[2],sF[0],sF[1],sF[2],np.dot(sF,nF))
+                #check normal and shear components are perpendicular... N.B. Due to generally low precision of the output forces, this will be only approximate hence the low level of precision
+                assert np.abs(np.dot(sF/np.linalg.norm(sF),nF/np.linalg.norm(nF))) < 1e-2, "Fn [%e,%e,%e] and Fs [%e,%e,%e] not perpendicular (dot=%e) !?!" % (nF[0],nF[1],nF[2],sF[0],sF[1],sF[2],np.dot(sF / np.linalg.norm(sF) ,nF / np.linalg.norm(nF)))
                 
                 #resolve combined force
                 force = nF + sF
                 
+                #also sum all forces acting on particle (these should sum to zero if the particle is in equillibrium) 
+                nsum += nF
+                tsum += np.cross(branch,sF)
+                
                 #add to stress tensor as per:
                 #Sij = 1 / volume * Sum(force_i * branch_j)
-                #N.B. THIS ASSUMES A STATIC MODEL - MOVING PARTICLES WILL RESULT IN NON-SYMETTRIC STRESS TENSORS?
                 stress[0,0] += force[0] * branch[0]
                 stress[0,1] += force[0] * branch[1]
                 stress[0,2] += force[0] * branch[2]
@@ -243,6 +259,42 @@ class RiceBall:
                 stress[2,1] += force[2] * branch[1]
                 stress[2,2] += force[2] * branch[2]
             
+            if (stress[0,0] > 1000):
+                print("uncorrected symmetric terms are: = %E, %E" % (stress[1,0],stress[0,1]))
+                
+            #compute residual force and apply to stress tensor to ensure symmetry
+            #n.b. - we need to treat normal and shear forces differently here????
+            if len(edges) > 0:
+                nResidual = np.linalg.norm(nsum)
+                tResidual = np.linalg.norm(tsum)
+                
+                if nResidual > 0:
+                    print( "normal residual = %E, shear residual = %E" % (nResidual,tResidual) )
+                    
+                    #calculate point to apply force (normal & shear) to cancel residual forces
+                    branch = ( nsum / nResidual ) #direction of residual normal force
+                    if not self.radii is None:
+                         branch *= self.radii[N]
+                         
+                    #normal force is simply the inverse of the residual normal source
+                    nF = -nsum 
+                    
+                    #calculate shear force that cancels residual torque
+                    sF = np.cross(tsum,branch) / (np.linalg.norm(branch) ** 2)
+                    
+                    #calculate combined force vector
+                    force = nF + sF
+                    
+                    stress[0,0] += force[0] * branch[0]
+                    stress[0,1] += force[0] * branch[1]
+                    stress[0,2] += force[0] * branch[2]
+                    stress[1,0] += force[1] * branch[0]
+                    stress[1,1] += force[1] * branch[1]
+                    stress[1,2] += force[1] * branch[2]
+                    stress[2,0] += force[2] * branch[0]
+                    stress[2,1] += force[2] * branch[1]
+                    stress[2,2] += force[2] * branch[2]
+
             #normalise to node volume (TODO - replace ball volume with veroni cell volume)
             V = 1
             if not self.radii is None:
@@ -250,7 +302,7 @@ class RiceBall:
             stress = stress / V
             
             if (stress[0,0] > 1000):
-                print(np.abs((stress[1,0] - stress[0,1]))/((stress[1,0] + stress[0,1])*0.5))
+                print("symmetric terms are: = %E, %E" % (stress[1,0],stress[0,1]))
             
             #store stress tensor
             S[N] = stress
