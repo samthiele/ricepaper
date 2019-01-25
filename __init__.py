@@ -1,6 +1,5 @@
 """
-A wrapper class for RiceBall. Manages the creation of model definition files, gives them to RiceBall and
-loads the output into python (using RiceBallReader) for analysis.
+A simple interface for generating and running riceball models. 
 
 Sam Thiele 2018
 """
@@ -11,6 +10,12 @@ import shutil
 
 from .reader import RiceBall
 
+"""
+A wrapper class for RiceBall. Manages the creation of model definition files, gives them to RiceBall and
+loads the output into python (using RiceBallReader) for analysis.
+
+Sam Thiele 2018
+"""
 class RicePaper:
 
     """
@@ -273,12 +278,14 @@ class RicePaper:
         self.hertz[index] = (shearModulus,poisson)
         #self.lines.append(self._defineHertzProperties()) #push to buffer
         self.lines.append("HERTZ %E %f %d\n" % (shearModulus,poisson,index))
+    
+    
     """
     Set the linear interaction properties between particle types (if used).
     
     **Arguments**:
-    -index1 = material type 1 of the interaction
-    -index2 = material type 2 of teh interaction
+    -index1 = particle type 1 of the interaction
+    -index2 = particle type 2 of teh interaction
     -normalStiffness = interaction normal stiffness
     -shearStiffness  = interaction shear stiffness
     """
@@ -293,14 +300,45 @@ class RicePaper:
     Set frictional properties for interactions between particle types.
     
     **Arguments**:
-    -index1 = the index of the first material type in the interaction
-    -index2 = the index of the second material type in the interaction.
+    -index1 = the index of the first particle type in the interaction
+    -index2 = the index of the second particle type in the interaction.
     -friction_coeff = the friction coefficient (=tan(friction angle)).
     """
+    
+    """
+    Set the properties of any bonds created between the specified particle types. N.B. this does not create any bonds! (use makeBond for that).
+    
+    **Arguments**:
+    -index1 = particle type 1 of the interaction
+    -index2 = particle type 2 of teh interaction
+    -normalStiffness = bond normal stiffness (Pa)
+    -shearStiffness  = bond shear stiffness (Pa)
+    -tStrength = tensile strength of the bond (Pa)
+    -sStrength = shear strength of the bond (at zero normal stress; Pa). The friction coefficient is used to linearly increase sstrength with increasing normal stress.
+    """
+    def setBond( self, index1, index2, normalStiffness, shearStiffness, tStrength, sStrength ):
+        _validateIdx(index1)
+        _validateIdx(index2)
+        self.lines.append("BONd %.2E %.2E %.2E %.2E %d %d\n" % (normalStiffness,shearStiffness,tStrength,sStrength,index1,index2))
+    
     def setFrictionItc(self, index1, index2, friction_coeff):
         _validateIdx(index1)
         _validateIdx(index2)
         self.lines.append("FRIC %f %d %d\n" % (friction_coeff,index1,index2))
+    
+    """
+    Set the cohesion between two particle types.
+    
+    **Arguments**:
+    -index1 = the index of the first particle type in the interaction.
+    -index2 = the index of the second particle type in the interaction.
+    -cohesion = the cohesion between the specified particle types.
+    
+    """
+    def setCohesion(self, index1, index2, cohesion):
+        _validateIdx(index1)
+        _validateIdx(index2)
+        self.lines.append("COH %f %d %d\n" % (cohesion,index1,index2))
     
     """
     Set numerical damping properties.

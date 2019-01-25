@@ -1,3 +1,11 @@
+"""
+Utility functions for a variety of common conversions or operations when building DEM models. 
+
+Sam Thiele 2018
+"""
+
+
+
 import numpy as np
 
 """
@@ -20,4 +28,15 @@ Young's and shear modulii.
 """
 def calcPoissonsRatio( E, G ):
     return (E/(2*G)) - 1
-    
+
+"""
+Convert friction angle to friction coefficient
+"""
+def frictAngleToCoeff( phi ):
+    return np.tan( np.deg2rad(phi) )
+
+"""
+Convert friction coefficient to friction angle
+"""
+def frictCoeffToAngle( c ): 
+    return np.rad2deg(np.arctan(c) )
