@@ -44,7 +44,7 @@ class DykeFarm:
             binsize = xrange / 100 #just use 100 bins as we don't no ball sizes...
         else:
             #set bin-size to twice the largest radius
-            binsize = max(self.model.STYPE.values())*2
+            binsize = max(self.model.radii.values())*2
         
         #calculate number of cells (range / bin size)
         ncells = int((maxx - minx) / binsize) + 1

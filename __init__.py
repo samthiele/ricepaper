@@ -7,6 +7,8 @@ import sys, os
 import numpy as np
 import subprocess
 import shutil
+import matplotlib.pyplot as plt
+import time
 
 from .reader import RiceBall
 
@@ -26,23 +28,31 @@ class RicePaper:
     -dir = the directory in which RiceBall files (both input and output) will be written.
     """
     def __init__(self,dir):
-        self.dir = dir #store output directory
+        self.dir = dir #output directory
         self.lines = [] #list of RiceBall commands
+        self.history = [] #list of all commands that lead to this model (rather than just from the last execute)
+        self.radii = {} #store particle radii for plotting etc. 
+        self.density = {} #store particle densities for postprocessing
+        self.name = "RiceBallSimulation"
+        
+        #model domain
         self.bounds = [15000,6000,100] #default bounds - xmax, ymax, zmax
         self.nballs = 50000 #default to max 10000 balls 
         self.nboxes = 9000
         self.nwall = 0
+        
+        #plotting params
         self.plotScale = 40 #length (model units) of 1 inch in figure
         self.forceScale = 5e12
-        self.name = "RiceBallSimulation"
-        self.radii = {1 : 10 } #default radii
-        self.density = {1 : 1000 } #default density
-        self.hertz = {1 : (2.9e9,0.2)}
+        
+        #misc.
         self.seed = 1 #seed for random number generators
-        self.step = 0 #index for counting timesteps
+        self.step = [0] #index for counting timesteps at each cycle command
+        self.time = [0] #store time at each save event
+        self.timestep = 1e-2 #model timestep
         self.file = 0 #index for counting files created
         self.restart=None
-        self.history = [] #list of all commands that lead to this model (rather than just from the last execute)
+
     def getAllLines(self):
         out = []
         out.append(self._startLines()) #write start lines
@@ -60,14 +70,13 @@ class RicePaper:
     -supress = If true, the model defenition file is written, but riceball is not invoked.
                This is useful if the model files have already been generated and you want to 
                fool ricepaper into thinking they have been freshly minted.
+    -printTiming = If True, the time taken to run riceball is printed to the console. Default is True. 
     **Returns**: 0 if riceball executes succesfully, or the log if returnLog is True.
     """
-    def execute(self,saveState=True,returnLog=False,restart=None,suppress=False):
+    def execute(self,saveState=True,returnLog=False,restart=None,suppress=False,printTiming=True):
         #check output directory exists
         if not os.path.exists(self.dir):
             os.makedirs(self.dir)
-        #cwd = os.getcwd()
-        #os.chdir(self.dir)
         
         #check for custom restart file
         if not restart is None:
@@ -83,7 +92,7 @@ class RicePaper:
             self.history += lines #include start lines
         else: #this is a restart - just include new lines
             self.history += self.lines
-
+        
         #add trailing lines
         if (saveState):
             lines.append("SAVE state_%d.sav\n" % self.file)
@@ -93,6 +102,9 @@ class RicePaper:
         f = open(os.path.join(self.dir,"trubalw.dat"),'w')
         f.writelines(lines)
         f.close()
+        
+        #store time
+        t0 = time.time()
         
         #run executable
         state = 0
@@ -104,6 +116,10 @@ class RicePaper:
         self.clear() #clear lines that have now been run
         self.restart = "state_%d.sav" % self.file #store link to restart file
 
+        #print time
+        if printTiming and not suppress:
+            print("RiceBall execution finished in %.2f minutes." % ((time.time()-t0) / 60))
+            
         if returnLog:
             if os.path.exists("trubalw.out"):
                 f=open("trubalw.out","r")
@@ -141,14 +157,16 @@ class RicePaper:
         clone.nwall = self.nwall
         clone.plotScale = self.plotScale
         clone.forceScale = self.forceScale
-        clone.radii = self.radii.copy()
-        clone.density = self.radii.copy()
-        clone.hertz = self.hertz.copy()
         clone.seed = self.seed
-        clone.step = self.step
+        clone.step = list(self.step)
         clone.file = self.file
         clone.restart = self.restart
         clone.history = list(self.history)
+        clone.radii = dict(self.radii)
+        clone.density = dict(self.density)
+        clone.time = list(self.time)
+        clone.step = list(self.step)
+        clone.timestep = self.timestep
         
         if not clone.restart is None:
             #create new directory and copy across restart file
@@ -167,7 +185,7 @@ class RicePaper:
         os.chdir(self.dir) #move into output dir
         fname = "Step%03d.out" % self.file
         assert os.path.exists(fname), "Error: no ouput file %s found" % fname
-        model = RiceBall(fname,radii=self.radii)
+        model = RiceBall(fname,radii=self.radii,density=self.density)
         os.chdir(cwd)
         return model
         
@@ -188,15 +206,80 @@ class RicePaper:
         for s in steps:
             fname = "Step%03d.out" % s
             assert os.path.exists(fname), "Error: no ouput file %s found" % fname
-            out.append(RiceBall(fname,radii=self.radii))
+            out.append(RiceBall(fname,radii=self.radii,density=self.density))
         os.chdir(cwd)
         
         if len(out) == 1:
             return out[0]
         else:
             return out
-    #these funcitions all change "stored" variables (that we might care about after).
-    #stored vars automatically get "prepended" to any model defenition files that we might write.
+    
+    """
+    Load output associated with the specified steps and then plots the kinetic energy and velocity over time. This is a quick
+    way to assess if the model has reached static equillibrium.
+    
+    **Arguemtns**:
+     - steps = a list of the steps to load and plot
+    
+    **Returns**:
+     -fig = the figure associated with the plot
+     -ax = the axes associated with the plot
+    """
+    def plotKinetics(self,steps):
+        #load models
+        M = self.loadSteps(steps)
+        
+        #get data 
+        medK = []
+        lqK = []
+        uqK = []
+        medV = []
+        lqV = []
+        uqV = []
+        for m in M:
+            pid,K = m.getAttributes("kin")
+            pid,V = m.getAttributes("speed")
+            medK.append(np.percentile(K,50))
+            lqK.append(np.percentile(K,25))
+            uqK.append(np.percentile(K,75))
+            medV.append(np.percentile(V,50))
+            lqV.append(np.percentile(V,25))
+            uqV.append(np.percentile(V,75))
+       
+        #get time
+        t = self.getTimeAt(steps)
+        
+        #plot
+        fig,ax = plt.subplots(1,2,figsize=(15,5))
+        fig.suptitle("Model Kinetics")
+        ax[0].semilogy(t,uqK,label="upper quartile")
+        ax[0].semilogy(t,medK,label="median")
+        ax[0].semilogy(t,lqK,label="lower quartile")
+        ax[0].legend()
+        ax[0].set_xlabel("Time (sec)")
+        ax[0].set_ylabel("Kinetic energy (J)")
+        
+        ax[1].plot(t,uqV,label="upper quartile")
+        ax[1].plot(t,medV,label="median")
+        ax[1].plot(t,lqV,label="lower quartile")
+        ax[1].axhline(0,color='k')
+        ax[1].legend()
+        ax[1].set_xlabel("Time (sec)")
+        ax[1].set_ylabel("Velocity (m/sec)")
+        
+        fig.show()
+        return fig,ax
+    """
+    Returns the time at the specified cycle step(s).
+    
+    **Arguments**:
+     - steps = integer or list of integers giving the step IDs to calculate the time for. Each step corresponds with a single
+               cycle command (in that order), and step 0 is the inital state (t=0). For example, step=2 corresponds to the second cycle command in the model. 
+    **Returns**:
+    An individual or list of time values.
+    """
+    def getTimeAt(self,steps):
+        return np.array(self.time)[steps]
     
     """
     Set the name of this simulation. This controls the output folder name.
@@ -213,8 +296,8 @@ class RicePaper:
         assert isinstance(zmax,int), "zmax must be an integer."
         
         #update bounds
-        self.bounds[0] = xmax,
-        self.bounds[1] = ymax,
+        self.bounds[0] = xmax
+        self.bounds[1] = ymax
         self.bounds[2] = zmax
         
         #update nboxes
@@ -224,7 +307,7 @@ class RicePaper:
         #update plotting scale
         if updateScale:
             #scale width to A4 sheet (total width = 8 inches)
-            self.plotScale = self.xmax / 8
+            self.plotScale = xmax / 8
      
     """
     Set the maximum number of balls that can be created in a this simulation. Note that this only works if called prior to the first execute() command.
@@ -250,9 +333,8 @@ class RicePaper:
     """
     def setRadius(self, index, value ):
         _validateIdx(index)
-        self.radii[index] = value
-        #self.lines.append(self._defineRadii()) #push to buffer
         self.lines.append("RAD %.2f %d\n" % (value, index))
+        self.radii[index] = value #store radii for future use
     """
     Define particle density.
     
@@ -262,9 +344,8 @@ class RicePaper:
     """
     def setDensity(self, index, density ):
         _validateIdx(index)
-        self.density[index] = density
-        #self.lines.append(self._defineDensity()) #push to buffer
         self.lines.append("DENS %d %d\n" % (density,index))
+        self.density[index] = density
     """
     Define hertzian material properties
     
@@ -275,8 +356,6 @@ class RicePaper:
     """
     def setHertzian(self, index, shearModulus, poisson ):
         _validateIdx(index)
-        self.hertz[index] = (shearModulus,poisson)
-        #self.lines.append(self._defineHertzProperties()) #push to buffer
         self.lines.append("HERTZ %E %f %d\n" % (shearModulus,poisson,index))
     
     
@@ -296,14 +375,6 @@ class RicePaper:
         
         #write
         self.lines.append("SH %E %d %d\nNO %E %d %d\n" % (shearStiffness,index1,index2,normalStiffness,index1,index2))
-    """
-    Set frictional properties for interactions between particle types.
-    
-    **Arguments**:
-    -index1 = the index of the first particle type in the interaction
-    -index2 = the index of the second particle type in the interaction.
-    -friction_coeff = the friction coefficient (=tan(friction angle)).
-    """
     
     """
     Set the properties of any bonds created between the specified particle types. N.B. this does not create any bonds! (use makeBond for that).
@@ -321,6 +392,14 @@ class RicePaper:
         _validateIdx(index2)
         self.lines.append("BONd %.2E %.2E %.2E %.2E %d %d\n" % (normalStiffness,shearStiffness,tStrength,sStrength,index1,index2))
     
+    """
+    Set frictional properties for interactions between particle types.
+    
+    **Arguments**:
+    -index1 = the index of the first particle type in the interaction
+    -index2 = the index of the second particle type in the interaction.
+    -friction_coeff = the friction coefficient (=tan(friction angle)).
+    """
     def setFrictionItc(self, index1, index2, friction_coeff):
         _validateIdx(index1)
         _validateIdx(index2)
@@ -357,6 +436,7 @@ class RicePaper:
             useVisc = 1
             viscous_fraction = 0.01
         
+        self.lines.append("\n**Set particle damping**\n")
         self.lines.append("DAMP %f %f %d %d\n" % (acceleration_fraction,viscous_fraction,useAcc,useVisc))
         
         #turn off other damping
@@ -372,7 +452,9 @@ class RicePaper:
     -xres = something even more important? Default is 1.0.
     """
     def setNumericalProperties(self,timestep=1e-2, frac=0.1,tol=3.5,xres=1.0):
-        self.lines.append("FRAC %f\nTOL %f\nXRES %f\nTS %f\n" % (frac,tol,xres,timestep))
+        self.timestep = timestep #store timestep
+        self.lines.append("\n**Set numerical tolerances and timestep**\n")
+        self.lines.append("FRAC %f\nTOL %f\nXRES %f\nTS %f\n\n" % (frac,tol,xres,timestep))
     
     """
     Create a line of balls.
@@ -406,8 +488,9 @@ class RicePaper:
     -gravity: vector as (x,y,z) describing gravitational acceleration.
     """
     def setGravity( self, gravity ):
+        self.lines.append("\n**Set gravitational acceleration vector**\n")
         assert len(gravity) == 3, "Gravity must be a 3D vector" #gravity is 3D
-        self.lines.append("GRAV %f %f %f\n" % gravity)
+        self.lines.append("GRAV %f %f %f\n\n" % gravity)
     
     """
     Fix (or release) the degrees of freedom for all particles in the domain.
@@ -421,6 +504,9 @@ class RicePaper:
     Set the domain in whicn new particles are created or particle properties are changed.
     """
     def setDomain( self, xmin, xmax, ymin, ymax, zmin, zmax ):
+        #write comment for readability
+        self.lines.append("\n**Generate, modify or delete particles**\n")
+        
         #set domain for creating particles
         self.lines.append("DOM %f %f %f %f %f %f\n" % (xmin,xmax,ymin,ymax,zmin,zmax))
         
@@ -477,20 +563,43 @@ class RicePaper:
         self.lines.append("GEN %d %d %d %d\n" % (nballs,shape_class,surface_class,color))
     
     """
+    Create a single particle at the specified location.
+    
+    **Arguments**:
+     -x = the x coordinate of the particle
+     -y = the y coordinate of the particle
+     -z = the z coordinate of the particle
+    -shape_class = the radius class of the balls to add.
+    -surface_class = the surface/material class of the balls to add. 
+    """
+    def addBall( self, x, y, z, shape_class, surface_class):
+        #add particle
+        self.lines.append("**Add a new particle\n")
+        self.lines.append("CR %.3f %.3f %.3f %d %d\n" % (x,y,z,shape_class,surface_class))
+    
+    """
     Write a cycle command to the model definition file. This will cause the model to be run for the specified number of timesteps when execute() is called.
     
     **Arguments**:
-    -ncycles = the number of cycles to run for.
+    -time = the time (in seconds) to run  for. 
     -storeOutput = If true, output files are written after the cycles. Default is True.
     -createFig = If true, output figures (postscript files) are written after the cycles. Default is False.
     
     **Returns**:
     -the stepID for this cycle. These can be used for retrieving output (if output has been saved). 
     """
-    def cycle(self, ncycles, storeOutput=True, createFig = False):
+    def cycle(self, time, storeOutput=True, createFig = False):
+        
+        #calculate number of cycles
+        ncycles = time / self.timestep
+        
         #increment trackers of number of steps/number of cycle calls
-        self.step += ncycles
+        self.step.append(self.step[-1] + ncycles)
+        self.time.append(self.time[-1] + ncycles * self.timestep)
         self.file += 1
+        
+        #write comment for readability
+        self.lines.append("\n\n**Cycle for %d timesteps (%.2f seconds) and save results.**\n" % (ncycles,time))
         
         #open new bondfile
         if storeOutput:
@@ -627,47 +736,26 @@ class RicePaper:
         f.writelines(lines)
         f.close()
         
-    
-    
-#   "Private" functions for writing properties in this class to definition files. These should not be called from outside this class...
-
+        
+#################################################################################
+#   "Private" functions for writing properties in this class to definition files. 
+#   These should not be called from outside this class...
+#################################################################################
     """
-    Create header lines for a new (as opposed to re-loaded) simulation.
+    Create header lines for a new (or re-loaded) simulation.
     """
     def _startLines(self):
-        if self.restart is None:
-            line = "START %d %d %d %d %d %d LOG\n" % (self.bounds[0],self.bounds[1],self.bounds[2],self.nboxes,self.nballs,self.nwall)
+        line = "**RiceBall model definition generated automatically using RicePaper interface.**\n"
+        line += "**For more info see https://github.com/samthiele/ricepaper)**\n\n"
+        if self.restart is None: #no restart file - define new simulation
+            line += "START %d %d %d %d %d %d LOG\n" % (self.bounds[0],self.bounds[1],self.bounds[2],self.nboxes,self.nballs,self.nwall)
             line += "P000 - %s\n" % self.name
             line += "2-D\n"
-        else:
+        else: #restart file exists - use it to init state
             line = "RESTART %s\n" % self.restart
         line += ("DMX %d\nFMX %.0E\n" % (self.plotScale,self.forceScale)).replace("+","")
         return line
-    """
-    Write the radii dictionary to the model definition file.
-    """
-    def _defineRadii(self):
-        line = ""
-        for key,value in self.radii.items():
-            line += "RAD %.2f %d\n" % (value, key)
-        return line
-    """
-    Write the density dictionary to the model definition file. 
-    """
-    def _defineDensity(self):
-        line = ""
-        for key,value in self.density.items():
-            line+= "DENS %d %d\n" % (value,key)
-        return line
-    """
-    Write the hertzian properties dictionary to the model defenintion file. 
-    """
-    def _defineHertzProperties(self):
-        line = ""
-        for key,value in self.hertz.items():
-            line+= "HERTZ %E %f %d\n" % (value[0],value[1],key)
-        return line
- 
+     
 """
 Quick and dirty multithreading tool for executing multiple riceball projects at once.
 

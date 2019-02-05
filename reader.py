@@ -8,15 +8,15 @@ Sam Thiele 2018
 """
 
 import sys, os
+import glob
 import networkx as nx
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
 #vtk stuff
 from pyevtk.hl import pointsToVTK
 from pyevtk.hl import polyLinesToVTK
-
-#import postprocess as pp
 
 """
 A class to encapsulate a riceball model state, as loaded from
@@ -28,21 +28,16 @@ class RiceBall:
     
     **Arguments**:
     - file = the filepath (string) of the output file (*.OUT) to load
-    
-    **Keywords**:
-    - radii = a dictionary containing the radius values for each shape ID. 
-              If passed, a dictionary defining the radius of each ball is defined.
+    - radii = A dictionary defining the radius of each ball is defined and each node given a radius. 
+    - density = A dictionary defining the density of each ball is defined and each node given a mass.
     """
-    def __init__(self,file,**kwds):
+    def __init__(self,file,radii,density):
         self.G = nx.Graph() #create a graph to store particles & interactions in
         self.pos = {} #dictionary allowing quick look-up of node positions given its id
         self.stress_computed = False
         self.file = file #store file path
-        self.radii = None
-        if "radii" in kwds:
-            self.STYPE = kwds["radii"]
-            assert isinstance(self.STYPE,dict), "Radii argument must be a dictionary linking S_TYPE to radius"
-            self.radii = {}
+        self.radii = radii #store radii dict
+        self.density = density #store density dict
         
         #check the file exists...
         assert os.path.exists(file), "Error - could not find file %s" % file
@@ -119,11 +114,19 @@ class RiceBall:
                 assert(nID in self.G.nodes), "Error - could no find all data for node %d" % nID
                 self.G.nodes[nID][column] = dataLine[i]
             
-            #get node radius?
+            #get node radius and volume
             if not self.radii is None:
                 sID = int(self.G.nodes[nID]["STYPE"])
-                assert sID in self.STYPE, "Error - unexpected STYPE found. Check %d is in radii dict." % sID
-                self.radii[nID] = self.STYPE[sID]
+                assert sID in self.radii, "Error - unexpected STYPE found. Check %d is in radii dict." % sID
+                self.G.nodes[nID]["radius"] = self.radii[sID]
+                self.G.nodes[nID]["volume"] = (self.radii[sID]**3) * (4/3) * np.pi
+            #get node mass and volume 
+            if not self.density is None:
+                mID = int(self.G.nodes[nID]["MTYPE"])
+                if mID == 0: #special case -> contains wall nodes
+                    self.density[mID] = 2500 #assign arbitrary density
+                assert mID in self.density, "Error - unexpected MTYPE found. Check %d is in radii dict." % mID
+                self.G.nodes[nID]["mass"] = self.density[mID]*self.G.nodes[nID]["volume"]
                 
         #finally, add edge data
         header = getHeader(data[lineNum])
@@ -178,159 +181,220 @@ class RiceBall:
     def nInteractions(self):
         return self.G.number_of_edges()
     
+    
     """
-    Computes the per-particle stress tensors as per https://doi.org/10.1016/j.compgeo.2016.03.006
+    Quicky extract per-particle attributes.
     
     **Arguments**:
-    -storeOnNodes = True if stress tensor should be written to each node in the underlying
-                    networkX graph (for later use?). Default is true.
-    **Returns**:
-    -a dictionary S such that S[nodeID] = stress tensor compued for nodeID.
+     - attr = A list of the attributes to get. Options are: 
+                - "position" = the position of each particle (m)
+                - "velocity" = the velocity vector of each particle (m/sec)
+                - "speed" = the speed (scalar) of each particle (m/sec)
+                - "mass" = the mass of each particle (kg)
+                - "density" = the density of each particle (kg/m^3)
+                - "radius" = the radius of each particle  (m)
+                - "volume" = the volume of each particle (m^3)
+                - "kinetic" = the kinetic energy of each particle (J)
+                - "momentum" = the momentum of each particle (kg m / sec )
+                - "force" = the net force acting on each particle.
+                - "torque" = the net torque acting on each particle. 
+                - "acceleration" = the linear accleration that would result from the net force on this particle.
+                - "stress" = a 3x3 stress per-particle stress tensor
+    **Keywords**:
+     - recalc = if true, all per-particle parameters are recalculated rather than just retrieved. Default is False. 
+     - ignoreFixed = if true, velocities of fixed particles are ignored. Default is true. 
+     - onlyFixed = if true, velocity of non-fixed particles are ignored. Useful for tests involving walls. Default is false.
+     - gravity = gravitational acceleration vector used for force calculations (only). Default is [0,-9.8,0].
+     - nodes = a list of node IDs to return attributes for (otherwise data from all nodes are returned). 
+    Returns:
+     - V = a list such that the first row contains particle IDs and subsequent rows contain 
+           the requested attributes (in the same order as in attr). 
     """
-    def computeParticleStresses(self,storeOnNodes = True):
-    
-        if self.stress_computed: #allready done!
-            return nx.get_node_attributes(self.G,"stress")
-            
-        #todo - construct veroni tesselation to get cell volumes
-
-        #create dict to store stress tensors in
-        S = {}
+    def getAttributes(self,attr,**kwds):
         
-        #loop through nodes
-        for N in self.G.nodes:
-            #get edges associated with this node
-            edges = self.G.edges(N,data=True)
+        #check attr is a list
+        if not isinstance(attr,list):
+            attr = [attr]
+        
+        #get kewords
+        recalc = kwds.get("recalc",False)
+        ignoreFixed = kwds.get("ignoreFixed",True)
+        onlyFixed = kwds.get("onlyFixed",False)
+        if onlyFixed: #can't have both as true...
+            ignoreFixed = False
             
-            #initialise null stress tensor
-            stress = np.zeros([3,3])
-            
-            #we also compute the vector sum of the forces - if they don't add to zero the stress tensor will be wrong!
-            nsum = np.zeros(3) #normal-force sum
-            tsum = np.zeros(3) #torque sum 
-            #loop through edges
-            for e in edges:
-                #get normal and shear force components from model
-                sF = np.array([float(e[2]["FS.x"]),float(e[2]["FS.y"]),float(e[2]["FS.z"])]) #shear force
-                nF = float(e[2]["FN"]) #normal force
+        gravity = kwds.get("gravity",np.array([0,-9.8,0]))
+        nodes = kwds.get("nodes",self.G.nodes)
+        
+        #init output array
+        out = [[] for i in range(len(attr) + 1)]
+        
+        #force recalc?
+        if recalc:
+            self.computeAttributes(gravity=gravity)
+        
+        #loop through particles
+        for N in nodes:
+            #ignore fixed/non-fixed particles depending on input
+            if ignoreFixed and '111' in self.G.nodes[N]["TFIXED"]:
+                continue
+            if onlyFixed and not '111' in self.G.nodes[N]["TFIXED"]:
+                continue
                 
-                #compute contact normal vector (the normal vector of this contact and the direction joining this particle to the contacting neighbour)
-                #cN = np.array([float(self.G.nodes[e[1]]["U.x"]),
-                #                   float(self.G.nodes[e[1]]["U.y"]),
-                #                   float(self.G.nodes[e[1]]["U.z"])])
-                #cN -= np.array([float(self.G.nodes[e[0]]["U.x"]),
-                #                   float(self.G.nodes[e[0]]["U.y"]),
-                #                   float(self.G.nodes[e[0]]["U.z"])])
-                #cN = cN / np.linalg.norm(cN) #normalise to unit vector
-                #nn = cN
-                
-                #cN is perpendicular to sF - calculate using cross product
-                #N.B. ONLY WORKS IN 2D! (i.e. when the z-component of all vectors is 0)
-                cN = np.cross( sF / np.linalg.norm(sF), np.array([0,0,1]))
-                cN = cN / np.linalg.norm(cN)
-                
-                #transform nF into vector by multiplying with contact normal
-                nF = nF * cN
-                
-                #calculate branch vector (normal vector * the particle radius)
-                branch = np.array(cN) #be sure to copy data rather than pointer!
-                if not self.radii is None: #are radii defined?
-                    branch *= self.radii[N] #multiply contact normal by particle radius
-                
-                #check normal and shear components are perpendicular... N.B. Due to generally low precision of the output forces, this will be only approximate hence the low level of precision
-                assert np.abs(np.dot(sF/np.linalg.norm(sF),nF/np.linalg.norm(nF))) < 1e-2, "Fn [%e,%e,%e] and Fs [%e,%e,%e] not perpendicular (dot=%e) !?!" % (nF[0],nF[1],nF[2],sF[0],sF[1],sF[2],np.dot(sF / np.linalg.norm(sF) ,nF / np.linalg.norm(nF)))
-                
-                #resolve combined force
-                force = nF + sF
-                
-                #also sum all forces acting on particle (these should sum to zero if the particle is in equillibrium) 
-                nsum += nF
-                tsum += np.cross(branch,sF)
-                
-                #add to stress tensor as per:
-                #Sij = 1 / volume * Sum(force_i * branch_j)
-                stress[0,0] += force[0] * branch[0]
-                stress[0,1] += force[0] * branch[1]
-                stress[0,2] += force[0] * branch[2]
-                stress[1,0] += force[1] * branch[0]
-                stress[1,1] += force[1] * branch[1]
-                stress[1,2] += force[1] * branch[2]
-                stress[2,0] += force[2] * branch[0]
-                stress[2,1] += force[2] * branch[1]
-                stress[2,2] += force[2] * branch[2]
-            
-            if (stress[0,0] > 1000):
-                print("uncorrected symmetric terms are: = %E, %E" % (stress[1,0],stress[0,1]))
-                
-            #compute residual force and apply to stress tensor to ensure symmetry
-            #n.b. - we need to treat normal and shear forces differently here????
-            if len(edges) > 0:
-                nResidual = np.linalg.norm(nsum)
-                tResidual = np.linalg.norm(tsum)
-                
-                if nResidual > 0:
-                    print( "normal residual = %E, shear residual = %E" % (nResidual,tResidual) )
-                    
-                    #calculate point to apply force (normal & shear) to cancel residual forces
-                    branch = ( nsum / nResidual ) #direction of residual normal force
-                    if not self.radii is None:
-                         branch *= self.radii[N]
-                         
-                    #normal force is simply the inverse of the residual normal source
-                    nF = -nsum 
-                    
-                    #calculate shear force that cancels residual torque
-                    sF = np.cross(tsum,branch) / (np.linalg.norm(branch) ** 2)
-                    
-                    #calculate combined force vector
-                    force = nF + sF
-                    
-                    stress[0,0] += force[0] * branch[0]
-                    stress[0,1] += force[0] * branch[1]
-                    stress[0,2] += force[0] * branch[2]
-                    stress[1,0] += force[1] * branch[0]
-                    stress[1,1] += force[1] * branch[1]
-                    stress[1,2] += force[1] * branch[2]
-                    stress[2,0] += force[2] * branch[0]
-                    stress[2,1] += force[2] * branch[1]
-                    stress[2,2] += force[2] * branch[2]
-
-            #normalise to node volume (TODO - replace ball volume with veroni cell volume)
-            V = 1
-            if not self.radii is None:
-                V = 4./3. * np.pi * self.radii[N]**3
-            stress = stress / V
-            
-            if (stress[0,0] > 1000):
-                print("symmetric terms are: = %E, %E" % (stress[1,0],stress[0,1]))
-            
-            #store stress tensor
-            S[N] = stress
-            
-            if storeOnNodes:
-                self.G.node[N]["stress"] = stress
-                self.stress_computed = True
-                #compute and store principal stresses
-                eigval,eigvec = np.linalg.eig(stress)
-                
-                #avoid complex numbers from null stresses
-                if True in np.iscomplex(eigval):
-                    eigval = np.zeros([3])
-                    eigvec = np.zeros([3,3])
-                
-                #sort eigens
-                idx = eigval.argsort()[::-1] #sort
-                eigval = eigval[idx]
-                eigvec = eigvec[:,idx].T #transpose so rows are vectors
-                
-                #store principal stresses
-                self.G.node[N]["sigma1"] = eigval[0] * eigvec[0]
-                #self.G.node[N]["sigma2"] = eigval[1] * eigvec[1] #meaningless in 2D
-                self.G.node[N]["sigma3"] = eigval[1] * eigvec[1]
-                self.G.node[N]["dif"] = eigval[0] - eigval[1] #differential stress
-                
-        return S
+            #loop through and get requested attributes
+            out[0].append(N) #store PID
+            for i,a in enumerate(attr):
+                a = a.lower() #conver to lower case
+                if "pos" in a: #get position
+                    out[i+1].append(np.array([float(self.G.nodes[N]["U.x"]),
+                                       float(self.G.nodes[N]["U.y"]),
+                                       float(self.G.nodes[N]["U.z"])]))
+                elif "vel" in a: #get velocity
+                    out[i+1].append(np.array([float(self.G.nodes[N]["UDOT.x"]),
+                                       float(self.G.nodes[N]["UDOT.y"]),
+                                       float(self.G.nodes[N]["UDOT.z"])]))
+                elif "spe" in a: #get speed
+                    out[i+1].append(np.linalg.norm(np.array([float(self.G.nodes[N]["UDOT.x"]),
+                                                   float(self.G.nodes[N]["UDOT.y"]),
+                                                   float(self.G.nodes[N]["UDOT.z"])])))
+                elif "mass" in a: #get mass
+                    out[i+1].append(self.G.nodes[N]["mass"])
+                elif "dens" in a: #get density
+                    mID = int(self.G.nodes[N]["MTYPE"])
+                    out[i+1].append(self.density[mID])
+                elif "rad" in a: #get radius
+                    out[i+1].append(self.G.nodes[N]["radius"])
+                elif "vol" in a: #get volume
+                    out[i+1].append(self.G.nodes[N]["volume"])
+                elif "kin" in a: #get kinetic energy
+                    if not "kinetic" in self.G.nodes[N]:
+                        self.computeAttributes(gravity=gravity)
+                    out[i+1].append( self.G.nodes[N]["kinetic"] )
+                elif "moment" in a:
+                    if not "momentum" in self.G.nodes[N]:
+                        self.computeAttributes(gravity=gravity)
+                    out[i+1].append( self.G.nodes[N]["momentum"] )
+                elif "torque" in a:
+                    if not "torque" in self.G.nodes[N]:
+                        self.computeAttributes(gravity=gravity)
+                    out[i+1].append( self.G.nodes[N]["torque"] )
+                elif "force" in a: 
+                    if not "force" in self.G.nodes[N]:
+                        self.computeAttributes(gravity=gravity)
+                    out[i+1].append( self.G.nodes[N]["force"] )
+                elif "acc" in a:
+                    if not "acc" in self.G.nodes[N]:
+                        self.computeAttributes(gravity=gravity)
+                    out[i+1].append( self.G.nodes[N]["acc"] )
+                elif "stress" in a:
+                    if not "stress" in self.G.nodes[N]:
+                        self.computeAttributes(gravity=gravity)
+                    out[i+1].append( self.G.nodes[N]["stress"] )
+                elif a in self.G.nodes[N]: #return any other node attribute
+                    out[i+1].append( self.G.nodes[N][a] ) 
+        #completo
+        return out
     
+    """
+    Pre-computes per-particle attributes such as stress, resultant force and acclerations. These are stored on the
+    node graph for later use (e.g. with getAttributes(...)) or export to vtk. 
+    
+    **Keywords**:
+        - gravity = gravitational acceleration vector used for force calculations (only). Default is [0,-9.8,0].
+        
+    """
+    def computeAttributes(self, **kwds):
+        
+        gravity = kwds.get("gravity",np.array([0,-9.8,0]))
+        
+        #loop through particles
+        for N in self.G.nodes:
+            
+            #compute kinetic energy and momentum
+            v = np.linalg.norm(np.array([float(self.G.nodes[N]["UDOT.x"]), #velocity
+                               float(self.G.nodes[N]["UDOT.y"]),
+                               float(self.G.nodes[N]["UDOT.z"])]))
+                               
+            self.G.nodes[N]["kinetic"] = 0.5*self.G.nodes[N]["mass"]*(v**2) #kinetic energy
+            self.G.nodes[N]["momentum"] = self.G.nodes[N]["mass"] * v
+            
+            #compute resultant force, acceleration and stress
+            A = np.array([float(self.G.nodes[N]["U.x"]),  #get position of this particle
+                         float(self.G.nodes[N]["U.y"]),
+                         float(self.G.nodes[N]["U.z"])])
+            
+            T = [ np.array([0,0,0]) ] #init torque to zero
+            F = [ gravity * self.G.nodes[N]["mass"] ] #init force to gravity
+            S = np.zeros([3,3]) #init null stress tensor 
+                    
+            for e in self.G.edges(N,data=True):
+                #get position of second particle
+                N2 = int(e[2]["BALL1"])
+                dir = 1.0 #shear force in correct orientation 
+                if N2 == N:
+                    N2 = int(e[2]["BALL2"])
+                    dir = -1.0 #shear force needs to be flipped
+                B = np.array([float(self.G.nodes[N2]["U.x"]),
+                           float(self.G.nodes[N2]["U.y"]),
+                           float(self.G.nodes[N2]["U.z"])])
+                
+                #calculate location force is applied
+                AB = B - A
+                nn = AB / np.linalg.norm(AB) #contact normal vector
+                R = self.G.nodes[N]["radius"] * nn #radius vector (sometimes called the "branch vector"0
+                
+                #get normal and shear force on contact
+                sF = np.array([float(e[2]["FS.x"]),float(e[2]["FS.y"]),float(e[2]["FS.z"])]) #shear force
+                nF = -float(e[2]["FN"]) * nn
+                
+                #flip direction of shear force depending on order of contact
+                sF *= dir
+                
+                #calculate torque vector from this contact
+                T.append( np.cross(R,sF) )
+                
+                #calculate force vector from this contact
+                f = nF + sF
+                F.append(f)
+                
+                #accumulate stress tensor
+                for u in range(3):
+                    for v in range(3):
+                        S[u][v] += R[u]*f[v]
+            
+            #normalise stress tensor and average shear components to ensure symmetry
+            S = S / self.G.nodes[N]["volume"]
+            S[0,1] = np.mean([S[0,1],S[1,0]])
+            S[1,0] = S[0,1]
+            
+            #calculate principal stresses
+            eigval, eigvec = np.linalg.eig(S)
+            idx = eigval.argsort()
+            eigval = eigval[idx]
+            eigvec = eigvec[:,idx]
+            self.G.nodes[N]["sig1"] = eigval[0] * eigvec[:,0]
+            self.G.nodes[N]["sig3"] = eigval[1] * eigvec[:,1]
+            
+            #calculate mean and deviatoric stresses (n.b. 2D case only!)
+            Sm = np.mean( [eigval[0],eigval[1]] )
+            self.G.nodes[N]["meanStress"] = Sm
+            self.G.nodes[N]["deviatoricStress"] = S + np.array( [[Sm,0,0], #n.b. we use + because compression is negative
+                                                                 [0,Sm,0],
+                                                                 [0,0,0]] )
+            
+            #calculate resultant force and torque and associated accelerations
+            rF = np.sum(F,axis=0)
+            rT = np.sum(T,axis=0)
+            acc = rF / self.G.nodes[N]["mass"]
+            ang = np.rad2deg(rT / (2/5*self.G.nodes[N]["mass"]*self.G.nodes[N]["radius"]**2))
+            
+            #store all on graph
+            self.G.nodes[N]["force"] = rF #net force
+            self.G.nodes[N]["torque"] = rT #net torque
+            self.G.nodes[N]["acc"] = acc #linear acceleration
+            self.G.nodes[N]["ang"] = ang #angular acceleration
+            self.G.nodes[N]["stress"] = S #stress tensor
+            
     """
     Computes the displacements between matching particles relative to the reference (prior-state) model.
     
@@ -402,19 +466,19 @@ class RiceBall:
     -minx,max,miny,maxy = the minimum and maximum positions for each axis
     """
     def getBounds(self,dynamic=False):
-        pos = list(self.pos.values())
-        if dynamic:
-            #filter out static nodes
-            pos = []
-            for N in self.G.nodes:
-                if self.G.nodes[N]["TFIXED"] != '111': #non-static ball
-                    pos.append(self.pos[N])
+        pos = []
+        r = []
+        for N in self.G.nodes:
+            if dynamic and self.G.nodes[N]["TFIXED"] == '111':
+                continue #skip static balls
+            pos.append(self.pos[N])
+            r.append(self.G.nodes[N]["radius"])
         
         #now calculate the bounds of all (valid) positions
-        minx = np.min(np.array(pos).T[0])
-        maxx = np.max(np.array(pos).T[0])
-        miny = np.min(np.array(pos).T[1])
-        maxy = np.max(np.array(pos).T[1])
+        minx = np.min(np.array(pos).T[0] - r)
+        maxx = np.max(np.array(pos).T[0] + r)
+        miny = np.min(np.array(pos).T[1] - r)
+        maxy = np.max(np.array(pos).T[1] + r)
         return minx,maxx,miny,maxy
         
     """
@@ -450,10 +514,10 @@ class RiceBall:
             id.append(N)
             tfixed.append(int(self.G.nodes[N]['TFIXED']))
             rfixed.append(int(self.G.nodes[N]['RFIXED']))
-            if self.radii is None:
-                r.append(int(self.G.nodes[N]['STYPE']))
+            if 'radius' in self.G.nodes[N]:
+                r.append(self.G.nodes[N]['radius'])
             else:
-                r.append(self.radii[N])
+                r.append(int(self.G.nodes[N]['STYPE']))
             if self.stress_computed:
                 S.append( self.G.node[N]["stress"] )
                 sig1.append( self.G.node[N]["sigma1"] )
@@ -534,65 +598,128 @@ class RiceBall:
     Creates a quick matplotlib visualisation of this model.
     
     **Arguments**:
-    -nodeSize = The size of the nodes in this figure. Default is 10.
+    -nodeSize = Fraction of particle radius used when drawing. Default is 1.0. 
     -nodeList = A list of nodes to be drawn. If None, all nodes are drawn. Default is None.
     -color = The color of the nodes to draw. If None, individual node colors are used.
     -hold = If true, the matplotlib canvas is held for future plot commands. Default is False.
     -figsize = The size of the matplotlib figure as (x,y). Default is (18,5).
     """
-    def quickPlot(self,nodeSize=10,nodeList=None,color=None,hold=False,figsize=(18,5)):
+    def quickPlot(self,nodeSize=1.0,nodeList=None,color=None,hold=False,figsize=(18,5)):
         #make/get list of nodes
         if nodeList is None:
             nodeList = self.G.nodes #all nodes
         
         #build plot
         plt.figure(figsize=figsize)
-        if not color is None: #specified draw color
-            nx.draw(self.G,self.pos,node_size=nodeSize,nodelist=nodeList,node_color=color,hold=True)
-        else:
-            #draw edges
-            nx.draw(self.G,self.pos,node_size=0.1,hold=True)
-            
-            colDict = {}
-            for n in nodeList:
-                #get node color
-                c = int(self.G.nodes[n]['COL'])
-                
-                #parse to matplotlib color
-                color = 'gray'
-                if c == 1:
-                    color = "g"
-                if c == 2:
-                    color = "y"
-                if c == 3:
-                    color = "r"
-                if c == 4:
-                    color = "w"
-                if c == 5:
-                    color = "k"
-                if c == 6:
-                    color = "gray"
-                if c == 7:
-                    color = "b"
-                if c == 8:
-                    color = "xkcd:cyan"
-                if c == 9:
-                    color = "xkcd:violet"
-                
-                if color in colDict:
-                    colDict[color].append(n) #add to existing list
+        
+        #draw edges
+        nx.draw(self.G,self.pos,node_size=0.1,hold=True)
+        
+        #build circles
+        circles = []
+        for i,n in enumerate(nodeList):
+            #get colour
+            c = "gray" #default
+            if color is None:
+                pc = int(self.G.nodes[n]['COL'])
+                if pc == 1:
+                    c = "g"
+                elif pc == 2:
+                    c ="y"
+                elif pc == 3:
+                    c = "r"
+                elif pc == 4:
+                    c = "w"
+                elif pc == 5:
+                    c = "k"
+                elif pc == 6:
+                    c = "gray"
+                elif pc == 7:
+                    c = "b"
+                elif pc == 8:
+                    c = "xkcd:cyan"
+                elif pc == 9:
+                    c = "xkcd:violet"
+            else: #use predefined colour
+                if isinstance(color,list):
+                    c = color[i]
                 else:
-                    colDict[color] = [n] #create new list
-                
-                #plot nodes for each color group
-            for color,nodeList in colDict.items():
-                nx.draw(self.G,self.pos,node_size=nodeSize,nodelist=nodeList,edgelist=[],node_color=color,hold=True)
-
+                    c = color
+            
+            #build circle patch
+            plt.gca().add_artist(matplotlib.patches.Circle(self.pos[n], 
+                            radius = self.G.nodes[n]["radius"]*nodeSize,
+                            color = c))
+        
+        #set limits
+        minx,maxx,miny,maxy = self.getBounds()
+        plt.gca().set_aspect('equal')
+        plt.xlim(minx,maxx)
+        plt.ylim(miny,maxy)
+        
         #draw figure?
         if not hold:
             plt.show() 
 
+    """
+    Plots the contact network and any particles that are subject to unbalanced forces that cause accelerations greater
+    than the specified threshold. Useful for identifying parts of an assemblage that are not static. 
+    
+    **Arguments**:
+     - minAcc = the acceleration threshold below which particles will not be plotted.
+     
+    **Keywords**:
+     - keywords are passed to RiceBall.getAttributes(...). Use to set gravity, ignore particle types etc. 
+    """
+    def plotUnbalanced( self, minAcc = 0.1, **kwds ):
+        pid, acc = self.getAttributes(["acc"],**kwds)
+        a = np.linalg.norm(acc,axis=1) #get magnitude of acceleration vectors
+        self.quickPlot(nodeList=np.array(pid)[a>minAcc]) #plot unbalanced particles
+    
+    """
+    Plot a histogram showing the net particle accelerations (net forces / particle mass).
+    
+    **Keywords**:
+     - keywords are passed to RiceBall.getAttributes(...). Use to set gravity, ignore particle types etc. 
+    """
+    def plotNetAcc( self, **kwds ):
+    
+        #get data
+        pid, force, torque = self.getAttributes(["force","torque"],**kwds)
+        
+        r = [] #resultant force
+        t = [] #net torque
+        for i,F in enumerate(force):
+            r.append( np.linalg.norm(sum(F)) / self.G.nodes[pid[i]]["mass"] ) #divide mass
+            t.append( np.rad2deg(np.linalg.norm(sum(torque[i])) / (2/5 * self.G.nodes[pid[i]]["mass"] * self.G.nodes[pid[i]]["radius"]**2 ))) #divide by moment of intertia
 
 
+        fig,ax = plt.subplots(1,2,figsize=(20,5))
 
+        ax[0].hist(r,bins=75,alpha=0.75,range=(0,np.percentile(r,90)))
+        ax[0].set_xlabel("Net linear acceleration (m/sec)")
+        ax[0].set_ylabel("# Particles")
+
+        ax[1].hist(t,bins=75,alpha=0.75,range=(0,np.percentile(r,90)))
+        ax[1].set_xlabel("Net angular acceleration (degrees/sec)")
+        ax[1].set_ylabel("# Particles")
+
+        fig.suptitle("Particle stability")
+        fig.show()
+    
+"""
+Utility function for loading all .OUT files in a given directory.
+
+**Arguments**:
+- dir = the directory path (string) containing the output files (*.OUT) to load
+- radii = A dictionary defining the radius of each ball is defined and each node given a radius. 
+- density = A dictionary defining the density of each ball is defined and each node given a mass.
+    
+"""
+def loadFromDir(dir,radii,density):
+    files = glob.glob(os.path.join(dir,"STEP*.out"))
+    out = []
+    for f in files:
+        out.append( RiceBall(f,radii,density) )
+    return out
 
