@@ -425,7 +425,59 @@ class RiceBall:
                 self.G.nodes[N]["disp"] = D[N] #store result
         return D
     
-    
+    """
+    Averages the stress tensor of each particle with those of its neighbours. 
+
+    **Arguments**
+     - n = number of times to recurse the averaging processes (essentially averaging the stress tensor over a wider area). Increase
+           this to get a smoother stress field. Default is 5.
+    """
+
+    def average_stress(self, n = 5):
+        for N in self.G.nodes:
+            
+            #check stress has been computed
+            if not "stress" in self.G.nodes[N]:
+                    self.computeAttributes()
+            
+            if not '111' in self.G.nodes[N]["TFIXED"]: #ignore fixed nodes (and associated invalid stress tensors)
+                
+                #init stress tensor to this particles stress multiply by the volume
+                S = self.G.nodes[N]["stress"] * self.G.nodes[N]["volume"]
+                vol = self.G.nodes[N]["volume"]
+
+                #accumulate other stress tensors
+                for N1,N2 in self.G.edges(N):
+                    assert N1 == N, "Error"
+                    if not '111' in self.G.nodes[N2]["TFIXED"]: #ignore fixed nodes (and associated invalid stress tensors)
+                        S += self.G.nodes[N2]["stress"] * self.G.nodes[N2]["volume"]
+                        vol += self.G.nodes[N2]["volume"]
+                
+                #normalise stress tensor again
+                S = S / vol
+                
+                #store stress tensor and derivatives
+                self.G.nodes[N]["stress"] = S
+                
+                #calculate principal stresses
+                eigval, eigvec = np.linalg.eig(S)
+                idx = eigval.argsort()[::-1]
+                eigval = eigval[idx]
+                eigvec = eigvec[:,idx]
+                self.G.nodes[N]["sig1"] = eigval[0] * eigvec[:,0]
+                self.G.nodes[N]["sig3"] = eigval[1] * eigvec[:,1]
+                
+                #calculate mean and deviatoric stresses (n.b. 2D case only!)
+                Sm = np.mean( [eigval[0],eigval[1]] )
+                self.G.nodes[N]["meanStress"] = Sm
+                self.G.nodes[N]["deviatoricStress"] = S - np.array( [[Sm,0,0],
+                                                                     [0,Sm,0],
+                                                                     [0,0,0]] )
+                
+        #recurse?
+        if n > 1:
+            self.average_stress(n-1)
+        
     """
     Removes particles on one side of a cutting line.
     
