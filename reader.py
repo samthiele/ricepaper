@@ -363,24 +363,36 @@ class RiceBall:
                         S[u][v] += R[u]*f[v]
             
             #normalise stress tensor and average shear components to ensure symmetry
-            S = S / self.G.nodes[N]["volume"]
-            S[0,1] = np.mean([S[0,1],S[1,0]])
-            S[1,0] = S[0,1]
-            
-            #calculate principal stresses
-            eigval, eigvec = np.linalg.eig(S)
-            idx = eigval.argsort()
-            eigval = eigval[idx]
-            eigvec = eigvec[:,idx]
-            self.G.nodes[N]["sig1"] = eigval[0] * eigvec[:,0]
-            self.G.nodes[N]["sig3"] = eigval[1] * eigvec[:,1]
-            
-            #calculate mean and deviatoric stresses (n.b. 2D case only!)
-            Sm = np.mean( [eigval[0],eigval[1]] )
-            self.G.nodes[N]["meanStress"] = Sm
-            self.G.nodes[N]["deviatoricStress"] = S + np.array( [[Sm,0,0], #n.b. we use + because compression is negative
-                                                                 [0,Sm,0],
-                                                                 [0,0,0]] )
+            if not '111' in self.G.nodes[N]["TFIXED"]:
+                S = S / self.G.nodes[N]["volume"]
+                
+                #make compression positive
+                S = S * -1
+                
+                #average shear stresses
+                S[0,1] = np.mean([S[0,1],S[1,0]])
+                S[1,0] = S[0,1]
+                
+                #calculate principal stresses
+                eigval, eigvec = np.linalg.eig(S)
+                idx = eigval.argsort()[::-1]
+                eigval = eigval[idx]
+                eigvec = eigvec[:,idx]
+                self.G.nodes[N]["sig1"] = eigval[0] * eigvec[:,0]
+                self.G.nodes[N]["sig3"] = eigval[1] * eigvec[:,1]
+                
+                #calculate mean and deviatoric stresses (n.b. 2D case only!)
+                Sm = np.mean( [eigval[0],eigval[1]] )
+                self.G.nodes[N]["meanStress"] = Sm
+                self.G.nodes[N]["deviatoricStress"] = S - np.array( [[Sm,0,0],
+                                                                     [0,Sm,0],
+                                                                     [0,0,0]] )
+            else: #special case for fixed nodes - write null stress tensors (as stress calculation will be garbage)
+                S = np.zeros([3,3])
+                self.G.nodes[N]["sig1"] = np.zeros(3)
+                self.G.nodes[N]["sig3"] = np.zeros(3)
+                self.G.nodes[N]["meanStress"] = 0
+                self.G.nodes[N]["deviatoricStress"] = S
             
             #calculate resultant force and torque and associated accelerations
             rF = np.sum(F,axis=0)
@@ -676,6 +688,136 @@ class RiceBall:
         a = np.linalg.norm(acc,axis=1) #get magnitude of acceleration vectors
         self.quickPlot(nodeList=np.array(pid)[a>minAcc]) #plot unbalanced particles
     
+    """
+    Plot particles in the model coloured by stress magnitude and with a tick showing the direction of sigma 1. 
+    
+    **Keywords**:
+        - type = The stress scalar to colour particles by. Default is "mag". Options are:
+            -"sig1" = use principal compressive stress magnitude
+            -"sig2" = use least compressive stress magnitude
+            -"mean" = use the mean or hydrostatic stress
+            -"mag" = the magnitude of the stress tensor
+            -"diff" or "dve" = the magnitude of the differential or deviatoric stress tensor
+            -"sx" = the shear stress in the x-direction
+            -"sy" = the shear stress in the y-direction
+            -"nx" = the normal stress in the x-direction
+            -"ny" = the normal stress in the y-direction
+        - cmap =  the matplotlib colour map to draw stress magnitudes with. Default is "magma".
+        - norm = a norm object to use for the colour mapping. Otherwise min to max is used. 
+        - vmin = min value of the norm object for colour mapping (alternative to passing norm object directly).
+        - vmax = max value of the norm object for colour mapping (alternative to passing norm object directly).
+        - tickLength = the length of sigma1 ticks as a fraction of particle radius. Default is 0.75.
+        - tickThickness = the thickness of sigma1 ticks in points. Default is 1.0.
+        - linecolor = the colour of the ticks. Default is 'white'. 
+        - nodeList = a list of nodes to plot. Default is all nodes. 
+        - nodeSize = Fraction of particle radius used when drawing. Default is 1.0. 
+        - figSize = the size of the figure. 
+        - ignoreFixed = True if only dynamic (i.e. non-fixed) particles should be plotted. Default is True as stress tensors for
+                        fixed particles will be incorrect. 
+        - title = the title of the plot. 
+    **Returns**:
+     - fig, ax = the figure that has been plotted.
+    """
+    def plotStress(self,**kwds):
+        
+        #get kwds
+        cmap = kwds.get("cmap","plasma")
+        if isinstance(cmap,str):
+            cmap = plt.get_cmap(cmap)
+        
+        type = kwds.get("type","mag")
+        tl = kwds.get("tickLength",0.75)
+        tt = kwds.get("tickThickness",1.0)
+        nodes = kwds.get("nodeList", self.G.nodes)
+        figSize = kwds.get("figSize", (10,10))
+        nodeSize = kwds.get("nodeSize", 1.0)
+        ignoreFixed = kwds.get("ignoreFixed", True)
+        title = kwds.get("title",type)
+        
+        #gather stress scalars
+        S = []
+        for N in nodes:
+        
+            if not "stress" in self.G.nodes[N]:
+                self.computeAttributes()
+            
+            #ignore fixed
+            if ignoreFixed and '111' in self.G.nodes[N]["TFIXED"]:
+                S.append(0)
+                continue
+                
+            if "sig1" in type:
+                S.append( np.linalg.norm(self.G.nodes[N]["sig1"]) )
+            elif "sig3" in type:
+                S.append( np.linalg.norm(self.G.nodes[N]["sig3"]) )
+            elif "mean" in type or "hyd" in type:
+                S.append( self.G.nodes[N]["meanStress"] )
+            elif "mag" in type:
+                S.append( np.linalg.norm( self.G.nodes[N]["stress"] ) )
+            elif "diff" in type or "dev" in type:
+                S.append( np.linalg.norm( self.G.nodes[N]["deviatoricStress"] ) )
+            elif "sx" in type:
+                S.append( self.G.nodes[N]["stress"][0,1] )
+            elif "sy" in type:
+                S.append( self.G.nodes[N]["stress"][1,0] )
+            elif "nx" in type:
+                S.append( self.G.nodes[N]["stress"][0,0] )
+            elif "ny" in type:
+                S.append( self.G.nodes[N]["stress"][1,1] )
+            
+        #build norm object
+        vmin = kwds.get("vmin",np.min(S))
+        vmax = kwds.get("vmax",np.max(S))
+        norm = kwds.get("norm",matplotlib.colors.Normalize( vmin=vmin, vmax=vmax ))
+        
+        #build plot
+        gs = matplotlib.gridspec.GridSpec(5,2, width_ratios=[25,1])
+        fig = plt.figure( figsize=figSize )
+        ax = [ plt.subplot( gs[:,0] ), plt.subplot( gs[2,1] ) ]
+        
+        #build circles
+        circles = []
+        for i,N in enumerate(nodes):
+            
+            #skip fixed
+            if ignoreFixed and '111' in self.G.nodes[N]["TFIXED"]:
+                continue
+                
+            #get colour
+            c = cmap( norm(S[i]) )
+            
+            #build circle patch
+            ax[0].add_artist(matplotlib.patches.Circle(self.pos[N], 
+                            radius = self.G.nodes[N]["radius"]*nodeSize,
+                            color = c))
+            
+            #build sigma1 tick
+            sig1M = np.linalg.norm(self.G.nodes[N]["sig1"])
+            if sig1M > 0:
+                sig1 = self.G.nodes[N]["sig1"] / sig1M
+                top = self.pos[N] + sig1[:2] * self.G.nodes[N]["radius"] * tl
+                bottom = self.pos[N] - sig1[:2] * self.G.nodes[N]["radius"] * tl
+                ax[0].add_artist(matplotlib.patches.Polygon(np.array([[top[0],top[1]],[bottom[0],bottom[1]]]),
+                                            closed=False,
+                                            color=kwds.get('linecolor','w'),
+                                            linewidth=tt ) )
+            
+        #set limits
+        minx,maxx,miny,maxy = self.getBounds()
+        ax[0].set_aspect('equal')
+        ax[0].set_xlim(minx,maxx)
+        ax[0].set_ylim(miny,maxy)
+        ax[0].set_title(title)
+        
+        #colorbar
+        cb1 = matplotlib.colorbar.ColorbarBase(ax[1], cmap=cmap,
+                                norm=norm,
+                                orientation='vertical')
+        cb1.set_label('Stress (Pa)')
+        fig.tight_layout()
+        
+        fig.show()
+        return fig,ax
     """
     Plot a histogram showing the net particle accelerations (net forces / particle mass).
     
