@@ -14,10 +14,6 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
-#vtk stuff
-from pyevtk.hl import pointsToVTK
-from pyevtk.hl import polyLinesToVTK
-
 """
 A class to encapsulate a riceball model state, as loaded from
 output files.
@@ -361,6 +357,17 @@ class RiceBall:
                 for u in range(3):
                     for v in range(3):
                         S[u][v] += R[u]*f[v]
+                        
+                #store per-contact vectors for future use/export
+                if nF[1] < 0: #store such that forces point up (i.e. are written such that they act on the top particle)
+                    nF *= -1
+                    sF *= -1
+                    R *= -1
+                e[2]["normal_force"] = nF #normal force
+                e[2]["shear_force"] = sF #shear force
+                e[2]["net_force"] = nF + sF #total force on contact
+                e[2]["torque"] = np.cross(R,sF)
+                e[2]["branch"] = R
             
             #normalise stress tensor and average shear components to ensure symmetry
             if not '111' in self.G.nodes[N]["TFIXED"]:
@@ -548,115 +555,154 @@ class RiceBall:
     """
     Writes the nodes and interactions in this model step to VTK file for
     visualisation in ParaView or similar.
-    
+
     **Arguments**:
     -filename = the base filename used to create the vtk files
     """
     def writeVTK(self, filename):
-        #gather node data
-        x = []
-        y = []
-        z = []
-        r = []
-        c = []
-        id = []
-        tfixed = []
-        rfixed = []
-        disp = []
-        
-        if self.stress_computed:
-            S = []
-            sig1 = []
-            sig3 = []
-            dif = []
 
-        for N in self.G.nodes:
-            x.append(self.pos[N][0])
-            y.append(self.pos[N][1])
-            z.append(0.0)
-            c.append(int(self.G.nodes[N]['COL']))
-            id.append(N)
-            tfixed.append(int(self.G.nodes[N]['TFIXED']))
-            rfixed.append(int(self.G.nodes[N]['RFIXED']))
-            if 'radius' in self.G.nodes[N]:
-                r.append(self.G.nodes[N]['radius'])
+        #open vtk file and write header
+        f = open(filename,"w")
+        f.write("# vtk DataFile Version 2.0\n")
+        f.write("Riceball DEM simulation\n")
+        f.write("ASCII\n")
+        f.write("DATASET UNSTRUCTURED_GRID\n")
+        f.write("POINTS %d float\n" % len(self.G.nodes()))
+
+        #define data lists
+        data = {} #list of  node-attributes
+        index = {} #dict linking node id's to local indices
+        
+        #define attributes to ignore (these are largely junk loaded from the .OUT files)
+        ignoreFilter = ["ADDRESS", 
+                        "U.x","U.y","U.z",
+                        "FSUM.x", 'FSUM.y', 'FSUM.z'
+                        'MSUM.x', 'MSUM.y', 'MSUM.z']
+
+        #gather data and write geometry (but not data yet) 
+        for i,N in enumerate(self.G.nodes):
+        
+            #store node index
+            index[N] = i
+            
+            #write point location
+            f.write("%f %f %f\t" % (float(self.G.nodes[N]["U.x"]),
+                                    float(self.G.nodes[N]["U.y"]),
+                                    float(self.G.nodes[N]["U.z"])))
+
+            #get and store attributes (to write later)
+            for key,value in self.G.nodes[N].items():
+                #is key in the ignore list
+                if key in ignoreFilter or "\n" in key:
+                    continue
+                #store
+                if key in data:
+                    data[key].append(value)
+                else:
+                    data[key] = [value]
+            if "id" in data:
+                data["id"].append(N)
             else:
-                r.append(int(self.G.nodes[N]['STYPE']))
-            if self.stress_computed:
-                S.append( self.G.node[N]["stress"] )
-                sig1.append( self.G.node[N]["sigma1"] )
-                sig3.append( self.G.node[N]["sigma3"] )
-                dif.append( self.G.node[N]["dif"] )
-            if "disp" in self.G.node[N]: #displacement has been computed
-                disp.append( self.G.node[N]["disp"] )
-                
-        #build point attribute dictionary
-        data = {"id" : np.array(id),
-                "radius" : np.array(r), 
-                "color" : np.array(c,dtype=int),
-                "DOF-T" : np.array(tfixed,dtype=int),
-                "DOF-R" : np.array(rfixed,dtype=int)}
+                data["id"] = [N]
+
+        #gather edge data and write geometry
+        ignoreFilter = ["BOX", "ADDRESS", 'WINDOW',
+                            "BALL1","BALL2","U.z",
+                            "FS.x", 'FS.y', 'FS.z',"Fs","FN",
+                            'XC.x', 'XC.y', 'XC.z']
+        eData = {}
         
-        if self.stress_computed: #TODO - figure out how to write non-scalar fields to VTK
-            data["sig1.magnitude"] = np.sqrt( np.array(sig1)[:,0]**2 + np.array(sig1)[:,1]**2)
-            data["sig1.x"] = np.array(sig1)[:,0] #sigma 1 vector (components)
-            data["sig1.y"] = np.array(sig1)[:,1]
-            data["sig3.magnitude"] = np.sqrt( np.array(sig3)[:,0]**2 + np.array(sig3)[:,1]**2)
-            data["sig3.x"] = np.array(sig3)[:,0] #sigma 3 vector (components)
-            data["sig3.y"] = np.array(sig3)[:,1]
-            data["S.xx"] = np.array(S)[:,0,0] #2D stress tensor
-            data["S.xy"] = np.array(S)[:,0,1]
-            data["S.yy"] = np.array(S)[:,1,1]
-            data["dif"] = np.array(dif)
-            
-        #export particle displacements
-        if len(disp) != 0: 
-            data["disp.magnitude"] = np.sqrt( np.array(disp)[:,0]**2 + np.array(disp)[:,1]**2)
-            data["disp.x"] = np.array(disp)[:,0]
-            data["disp.y"] = np.array(disp)[:,1]
-        
-        #write nodes
-        pointsToVTK(filename + "_balls",np.array(x),np.array(y),np.array(z),
-                                    data = data)
-        
-        #gather edge data
-        x = []
-        y = []
-        z = []
-        sID = []
-        eID = []
-        ppl = [] #number of points per line. Always = 2.
-        Fn = []
-        Fs = [] #magnitude of shear force
-        Fsx = [] #x-component of shear force
-        Fsy = [] #y-component of shear force
-            
+        f.write("\nCELLS %d %d\n" % (len(self.G.edges),3*len(self.G.edges)))
         for e in self.G.edges(data=True):
-            x += [self.pos[e[0]][0],self.pos[e[1]][0]]
-            y += [self.pos[e[0]][1],self.pos[e[1]][1]]
-            z += [0.0,0.0]
-            sID.append(e[0])
-            eID.append(e[1])
-            ppl.append(2) 
-            Fn.append(float(e[2]["FN"]))
-            Fsx.append(float(e[2]["FS.x"]))
-            Fsy.append(float(e[2]["FS.y"]))
-            Fs.append(e[2]["Fs"])
             
-        #build properties dict
-        cellData = {"Point1" : np.array(sID,dtype=int), 
-                                         "Point2" : np.array(eID,dtype=int),
-                                         "Fn" : np.array(Fn),
-                                         "Fs" : np.array(Fs),
-                                         "Fs.x" : np.array(Fsx),
-                                         "Fs.y" : np.array(Fsy)}
-                                         
-        #write lines vtk
-        polyLinesToVTK(filename + "_interactions",np.array(x),np.array(y),np.array(z),
-                              pointsPerLine = np.array(ppl,dtype=int),
-                              cellData=cellData)
-                              
-                              
+            #write edge
+            N1 = index[e[0]] 
+            N2 = index[e[1]]
+            f.write("2 %d %d\t" % (N1,N2))
+            
+            #store data
+            for key,value in e[2].items():
+                #is key in the ignore list
+                
+                if key in ignoreFilter or "\n" in key:
+                    continue
+                #store
+                if isinstance(value,str):
+                    value = float(value)
+                if key in eData:
+                    eData[key].append(value)
+                else:
+                    eData[key] = [value]
+        
+        #write cell types
+        f.write("\nCELL_TYPES %d\n" % len(self.G.edges))
+        for e in self.G.edges(data=False):
+            f.write("3\t")
+        
+        #write node attributes
+        f.write("\nPOINT_DATA %d" % len(self.G.nodes))
+        for key in data:
+            vals = data[key]
+
+            #write int array
+            if isinstance(vals[0],int):
+                f.write("\nSCALARS %s int\nLOOKUP_TABLE default\n" % key) 
+                for v in vals:
+                    f.write("%d\t" % v)
+
+            #write float array
+            if isinstance(vals[0],float):
+                f.write("\nSCALARS %s float\nLOOKUP_TABLE default\n" % key) 
+                for v in vals:
+                    f.write("%f\t" % v)
+
+            #write vectors and tensors array
+            if isinstance(vals[0],np.ndarray):
+                #3D Vector
+                if vals[0].shape == (3,):
+                    f.write("\nVECTORS %s float\n" % key) 
+                    for v in vals:
+                        f.write("%f %f %f\t" % (v[0],v[1],v[2]))
+                #3D Tensor
+                if vals[0].shape == (3,3):
+                    f.write("\nTENSORS %s float\n" % key) 
+                    for v in vals:
+                        f.write("%f %f %f %f %f %f %f %f %f\n" % (v[0,0],v[0,1],v[0,2],
+                                                                  v[1,0],v[1,1],v[1,2],
+                                                                  v[2,0],v[2,1],v[2,2]))
+        
+        #write cell attributes
+        f.write("\nCELL_DATA %d" % len(self.G.edges))
+        for key in eData:
+            vals = eData[key]
+            
+            #write int array
+            if isinstance(vals[0],int):
+                f.write("\nSCALARS %s int\nLOOKUP_TABLE default\n" % key) 
+                for v in vals:
+                    f.write("%d\t" % v)
+
+            #write float array
+            if isinstance(vals[0],float):
+                f.write("\nSCALARS %s float\nLOOKUP_TABLE default\n" % key) 
+                for v in vals:
+                    f.write("%f\t" % v)
+
+            #write vectors and tensors array
+            if isinstance(vals[0],np.ndarray):
+                #3D Vector
+                if vals[0].shape == (3,):
+                    f.write("\nVECTORS %s float\n" % key) 
+                    for v in vals:
+                        f.write("%f %f %f\t" % (v[0],v[1],v[2]))
+                #3D Tensor
+                if vals[0].shape == (3,3):
+                    f.write("\nTENSORS %s float\n" % key) 
+                    for v in vals:
+                        f.write("%f %f %f %f %f %f %f %f %f\n" % (v[0,0],v[0,1],v[0,2],
+                                                                  v[1,0],v[1,1],v[1,2],
+                                                                  v[2,0],v[2,1],v[2,2]))
+        f.close()
                               
     """
     Creates a quick matplotlib visualisation of this model.
