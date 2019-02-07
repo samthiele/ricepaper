@@ -851,9 +851,13 @@ class RiceBall:
             -"sig3" = the minor eigenvalue
             -"mean" = the mean eigenvalue
             -"dif" = the difference between the principal eigenvalues (sig1 - sig3)
+            -"inv1" = the first invariant
+            -"inv2" = the second invariant
+            -"inv3" = the third invariant
             -"xx" = The xx component
             -"yy" = They yy component
             -"xy" = the xy component
+            -"yx" = the yx component
             -custom = custom functions can also be passed here (and will be used in the form *scalar = func( tensor )*
         - cmap =  the matplotlib colour map to draw stress magnitudes with. Default is "magma".
         - vmin = min value of the norm object for colour mapping. Defaults to the min of the data plotted. 
@@ -880,7 +884,7 @@ class RiceBall:
         cmap = kwds.get("cmap","plasma")
         vmin = kwds.get("vmin",None)
         vmax = kwds.get("vmax",None)
-        
+        func = kwds.get("func","mag")
         #convert keywords to lists as necessary (such that there is a value per plot)
         if isinstance(attr,str):
             attr = [attr]
@@ -894,13 +898,20 @@ class RiceBall:
             vmin = [vmin] * len(attr)
         if not isinstance(vmax,list):
             vmax = [vmax] * len(attr)
+        if not isinstance(func,list):
+            func = [func] * len(attr)
             
+        assert len(cmap) == len(attr)
+        assert len(title) == len(attr)
+        assert len(linewidth) == len(attr)
+        assert len(vmin) == len(attr)
+        assert len(vmax) == len(attr)
+        assert len(func) == len(attr)
+        
         #init figure
         fig, ax = plt.subplots( 1, len(attr), figsize=kwds.get("figsize",(10,10)) )
         if not isinstance(ax,np.ndarray):
             ax = [ax]
-            
-            
         for pn, name in enumerate(attr):
             
             #get cmap
@@ -957,25 +968,38 @@ class RiceBall:
                         hasTicks = True
 
                         #get scalar
-                        func = kwds.get("func","mag")
-                        if callable(func):
-                            scalar.append( func( A ) ) #custom function passed
-                        elif "sig1" in func:
+                        f = func[pn]
+                        if callable(f):
+                            scalar.append( f( A ) ) #custom function passed
+                        elif "sig1" in f:
                             scalar.append( eigval[0] )
-                        elif "sig3" in func:
+                        elif "sig3" in f:
                             scalar.append( eigval[1] )
-                        elif "mean" in func or "hyd" in func:
+                        elif "mean" in f or "hyd" in func:
                             scalar.append( (eigval[0] + eigval[1]) / 2 )
-                        elif "mag" in func:
+                        elif "mag" in f:
                             scalar.append( np.linalg.norm( A ) )
-                        elif "dif" in func:
+                        elif "dif" in f:
                             scalar.append( np.abs(eigval[0] - eigval[1]) )
-                        elif "xx" in func:
+                        elif "inv1" in f:
+                            scalar.append( np.sum(eigval) )
+                        elif "inv2" in f:
+                            if len(eigval == 2):
+                                scalar.append( np.abs(eigval[0]*eigval[1]) )
+                            elif len(eigval == 3):
+                                scalar.append( np.abs(eigval[0]*eigval[1] + eigval[1]*eigval[2] + eigval[2]*eigval[0] ) )
+                            else:
+                                assert False, "Can only calculate inv2 of a 2x2 or 3x3 tensor"
+                        elif "inv3" in f:
+                            scalar.append( np.abs(np.prod(eigval))  )
+                        elif "xx" in f:
                             scalar.append( A[0,0] )
-                        elif "yy" in func:
+                        elif "yy" in f:
                             scalar.append( A[1,1] )
-                        elif "xy" in func:
+                        elif "xy" in f:
                             scalar.append( A[0,1] )
+                        elif "yx" in f:
+                            scalar.append( A[1,0] )
 
             #build norm object
             if len(scalar) > 0:
