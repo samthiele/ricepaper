@@ -53,6 +53,8 @@ class RicePaper:
         self.file = 0 #index for counting files created
         self.restart=None
 
+        
+        
     def getAllLines(self):
         out = []
         out.append(self._startLines()) #write start lines

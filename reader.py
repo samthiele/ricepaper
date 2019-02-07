@@ -13,6 +13,7 @@ import networkx as nx
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+import numbers
 
 """
 A class to encapsulate a riceball model state, as loaded from
@@ -385,21 +386,15 @@ class RiceBall:
                 idx = eigval.argsort()[::-1]
                 eigval = eigval[idx]
                 eigvec = eigvec[:,idx]
-                self.G.nodes[N]["sig1"] = eigval[0] * eigvec[:,0]
-                self.G.nodes[N]["sig3"] = eigval[1] * eigvec[:,1]
                 
-                #calculate mean and deviatoric stresses (n.b. 2D case only!)
+                #calculate deviatoric stresses (n.b. 2D case only!)
                 Sm = np.mean( [eigval[0],eigval[1]] )
-                self.G.nodes[N]["meanStress"] = Sm
-                self.G.nodes[N]["deviatoricStress"] = S - np.array( [[Sm,0,0],
-                                                                     [0,Sm,0],
-                                                                     [0,0,0]] )
+                self.G.nodes[N]["deviatoric_stress"] = S - np.array( [[Sm,0,0],
+                                                                      [0,Sm,0],
+                                                                      [0,0, 0]] )
             else: #special case for fixed nodes - write null stress tensors (as stress calculation will be garbage)
                 S = np.zeros([3,3])
-                self.G.nodes[N]["sig1"] = np.zeros(3)
-                self.G.nodes[N]["sig3"] = np.zeros(3)
-                self.G.nodes[N]["meanStress"] = 0
-                self.G.nodes[N]["deviatoricStress"] = S
+                self.G.nodes[N]["deviatoric_stress"] = S
             
             #calculate resultant force and torque and associated accelerations
             rF = np.sum(F,axis=0)
@@ -413,7 +408,67 @@ class RiceBall:
             self.G.nodes[N]["acc"] = acc #linear acceleration
             self.G.nodes[N]["ang"] = ang #angular acceleration
             self.G.nodes[N]["stress"] = S #stress tensor
+    
+    """
+    Computes approximate per-particle strain tensors (2D) based on the relative displacements of the neighouring particles.
+    This is achieved by finding a deformation gradient tensor that best explains the observed displacements using least-squares
+    regression. The results are stored on the node graph as "strain", "deviatoric_strain" and the jacobian (dilational strain) "J".
+    """
+    def computeStrain2D(self,reference):
+        for N in self.G.nodes:
             
+            #init strain tensor and deformation gradient tensor
+            F = np.eye(2)
+            S = np.zeros((2,2))
+            rmse  = -1.0
+            
+            #if we have a reference to compare to, calculate deformation gradient and strain
+            if N in reference.G.nodes:
+                o1 = np.array(reference.pos[N]) #initial position of this node
+                o2 = np.array(self.pos[N]) #deformed position of this node
+                U1 = [] #relative position of neighbours in initial state
+                U2 = [] #relative postion of neighbours in final state
+                for e in self.G.edges(N):
+                
+                    #skip new nodes
+                    if not e[1] in reference.G.nodes:
+                        continue
+                    
+                    #calculate relative positions and position change
+                    U1.append(np.array(reference.pos[e[1]]) - o1)
+                    U2.append(np.array(self.pos[e[1]]) - o2)
+                
+                if len(U1) > 2: #need at least two neighbours
+                    
+                    #assemble vectors as column matrix
+                    U1 = np.array(U1)
+                    U2 = np.array(U2)
+
+                    #calculate deformation tensor by least squares regression
+                    #F = (U1_t . U1)^-1 . U1_t . U2
+                    F = np.dot( np.linalg.inv(np.dot(U1.T,U1)) , np.dot(U1.T,U2)) 
+
+                    #calculate RMSE
+                    rmse = np.sqrt( np.mean( np.linalg.norm( np.dot(U1,F) - U2 , axis=1)**2 ) )
+                    
+                    #decompose deformation gradient tensor to get strain tensor
+                    S = 0.5 * (F + F.T) - np.eye(2)
+
+            #store
+            self.G.nodes[N]["F"] = F
+            self.G.nodes[N]["F_rmse"] = rmse
+            self.G.nodes[N]["strain"] = S
+            
+            #calculate principal strains
+            eigval, eigvec = np.linalg.eig(S)
+            idx = eigval.argsort()[::-1]
+            eigval = eigval[idx]
+            eigvec = eigvec[:,idx]
+            
+            #store invariants
+            self.G.nodes[N]["J"] = np.linalg.det(F) #volumetric strain/jacobian
+            self.G.nodes[N]["deviatoric_strain"] = S - np.array([[np.mean(eigval),0],[0,np.mean(eigval)]])
+    
     """
     Computes the displacements between matching particles relative to the reference (prior-state) model.
     
@@ -433,64 +488,60 @@ class RiceBall:
         return D
     
     """
-    Averages the stress tensor of each particle with those of its neighbours. 
+    Averages attributes of each particle with those of its neighbours. 
 
     **Arguments**
-     - n = number of times to recurse the averaging processes (essentially averaging the stress tensor over a wider area). Increase
+     - attr = the name of the attribute to average. This must be defined for every node. 
+     - n = number of times to recurse the averaging processes (essentially averaging the attribute over a wider area). Increase
            this to get a smoother stress field. Default is 5.
+     - weighted = True if the average is weighted by node volume. Default is True. 
+     - ignoreFixed = True if fixed nodes are ignored in the averaging. Default is True.
     """
-
-    def average_stress(self, n = 5):
+    def averageAttr(self, attr, n = 5, weighted=True, ignoreFixed=True):
+        #loop through nodes
         for N in self.G.nodes:
             
-            #check stress has been computed
-            if not "stress" in self.G.nodes[N]:
-                    self.computeAttributes()
+            #check attribute has been computed
+            if not attr in self.G.nodes[N]:
+                self.computeAttributes()
+                assert attr in self.G.nodes[N], 'Error: %s is not defined for node %d.' % (attr,N)
             
-            if not '111' in self.G.nodes[N]["TFIXED"]: #ignore fixed nodes (and associated invalid stress tensors)
-                
-                #init stress tensor to this particles stress multiply by the volume
-                S = self.G.nodes[N]["stress"] * self.G.nodes[N]["volume"]
-                vol = self.G.nodes[N]["volume"]
+            #skip fixed nodes?
+            if ignoreFixed and '111' in self.G.nodes[N]["TFIXED"]:
+                continue
 
-                #accumulate other stress tensors
-                for N1,N2 in self.G.edges(N):
-                    assert N1 == N, "Error"
-                    if not '111' in self.G.nodes[N2]["TFIXED"]: #ignore fixed nodes (and associated invalid stress tensors)
-                        S += self.G.nodes[N2]["stress"] * self.G.nodes[N2]["volume"]
-                        vol += self.G.nodes[N2]["volume"]
+            #check for string values (hacky, but handy)
+            if isinstance(self.G.nodes[N][attr],str):
+                self.G.nodes[N][attr] = float(self.G.nodes[N][attr])
                 
-                #normalise stress tensor again
-                S = S / vol
-                
-                #store stress tensor and derivatives
-                self.G.nodes[N]["stress"] = S
-                
-                #calculate principal stresses
-                eigval, eigvec = np.linalg.eig(S)
-                idx = eigval.argsort()[::-1]
-                eigval = eigval[idx]
-                eigvec = eigvec[:,idx]
-                self.G.nodes[N]["sig1"] = eigval[0] * eigvec[:,0]
-                self.G.nodes[N]["sig3"] = eigval[1] * eigvec[:,1]
-                
-                #calculate mean and deviatoric stresses (n.b. 2D case only!)
-                Sm = np.mean( [eigval[0],eigval[1]] )
-                self.G.nodes[N]["meanStress"] = Sm
-                self.G.nodes[N]["deviatoricStress"] = S - np.array( [[Sm,0,0],
-                                                                     [0,Sm,0],
-                                                                     [0,0,0]] )
-                
+            #get attribute and volumes of this node and its neighbours      
+            A = [self.G.nodes[N][attr]]
+            vol = [self.G.nodes[N]["volume"]]
+            for N1,N2 in self.G.edges(N):
+                if ignoreFixed and '111' in self.G.nodes[N2]["TFIXED"]:
+                    continue
+                #check for string values (hacky, but handy)
+                if isinstance(self.G.nodes[N2][attr],str):
+                    self.G.nodes[N2][attr] = float(self.G.nodes[N2][attr])
+                A.append(self.G.nodes[N2][attr])
+                vol.append(self.G.nodes[N2]["volume"])
+            
+            #calculate and store average
+            if weighted:
+                self.G.nodes[N][attr] = np.average(A, weights = vol / np.sum(vol), axis=0 )
+            else:
+                self.G.nodes[N][attr] = np.average(A)
+           
         #recurse?
         if n > 1:
-            self.average_stress(n-1)
-        
+            self.averageAttr(attr,n=n-1,weighted=weighted,ignoreFixed=ignoreFixed)
+    
     """
     Removes particles on one side of a cutting line.
     
     **Arguments**:
     -x = the x-intercept of the cutting line
-    -dip = the dip (degrees) of the cutting line.Positive values are west-dipping.
+    -dip = the dip (degrees) of the cutting line. Positive values are west-dipping.
     -lower = True (default) if points under the line are retained. If false, points above the line are retained.
     -ignoreFixed =  True (default) if fixed points (typically boundary points) are ignored by the cutting operation.
     **Returns**
@@ -787,135 +838,197 @@ class RiceBall:
         self.quickPlot(nodeList=np.array(pid)[a>minAcc]) #plot unbalanced particles
     
     """
-    Plot particles in the model coloured by stress magnitude and with a tick showing the direction of sigma 1. 
+    Plot particles in the model coloured by an attribute (if it is scalar), its magnitude (if it is a vector), or a
+    tensor invariants (e.g. for stress or strain). 
     
+    **Arguments**:
+     - attr = the name of the attribute to plot. This can be any scalar, vector or tensor attribute so long as it is defined
+                 for each node.
     **Keywords**:
-        - type = The stress scalar to colour particles by. Default is "mag". Options are:
-            -"sig1" = use principal compressive stress magnitude
-            -"sig2" = use least compressive stress magnitude
-            -"mean" = use the mean or hydrostatic stress
-            -"mag" = the magnitude of the stress tensor
-            -"diff" or "dve" = the magnitude of the differential or deviatoric stress tensor
-            -"sx" = the shear stress in the x-direction
-            -"sy" = the shear stress in the y-direction
-            -"nx" = the normal stress in the x-direction
-            -"ny" = the normal stress in the y-direction
+        - func = If a tensor is specified, this defines the scalar value to plot. Default is "mag". 
+            -"mag" = the magnitude of the tensor
+            -"sig1" = the principal eigenvalue
+            -"sig3" = the minor eigenvalue
+            -"mean" = the mean eigenvalue
+            -"dif" = the difference between the principal eigenvalues (sig1 - sig3)
+            -"xx" = The xx component
+            -"yy" = They yy component
+            -"xy" = the xy component
+            -custom = custom functions can also be passed here (and will be used in the form *scalar = func( tensor )*
         - cmap =  the matplotlib colour map to draw stress magnitudes with. Default is "magma".
-        - norm = a norm object to use for the colour mapping. Otherwise min to max is used. 
-        - vmin = min value of the norm object for colour mapping (alternative to passing norm object directly).
-        - vmax = max value of the norm object for colour mapping (alternative to passing norm object directly).
-        - tickLength = the length of sigma1 ticks as a fraction of particle radius. Default is 0.75.
-        - tickThickness = the thickness of sigma1 ticks in points. Default is 1.0.
+        - vmin = min value of the norm object for colour mapping. Defaults to the min of the data plotted. 
+        - vmax = max value of the norm object for colour mapping. Defaults to the max of the data plotted. 
+        - tickLength = the length of orientation ticks as a fraction of particle radius. Default is 0.75.
+        - linewidth = the thickness of orientation ticks in points. Default is 1.0.
         - linecolor = the colour of the ticks. Default is 'white'. 
-        - nodeList = a list of nodes to plot. Default is all nodes. 
-        - nodeSize = Fraction of particle radius used when drawing. Default is 1.0. 
-        - figSize = the size of the figure. 
+        - nodelist = a list of nodes to plot. Default is all nodes. 
+        - nodesize = Fraction of particle radius used when drawing. Default is 1.0. 
+        - figsize = the size of the figure. 
         - ignoreFixed = True if only dynamic (i.e. non-fixed) particles should be plotted. Default is True as stress tensors for
                         fixed particles will be incorrect. 
         - title = the title of the plot. 
+        - label = the label of the colour bar. 
     **Returns**:
      - fig, ax = the figure that has been plotted.
     """
-    def plotStress(self,**kwds):
+    def plotAttr(self,attr, **kwds):
         
-        #get kwds
+        #get keywords
+        nodes = kwds.get("nodelist", self.G.nodes)
+        title = kwds.get("title",attr)
+        linewidth = kwds.get("linewidth",1.0)
         cmap = kwds.get("cmap","plasma")
-        if isinstance(cmap,str):
-            cmap = plt.get_cmap(cmap)
+        vmin = kwds.get("vmin",None)
+        vmax = kwds.get("vmax",None)
         
-        type = kwds.get("type","mag")
-        tl = kwds.get("tickLength",0.75)
-        tt = kwds.get("tickThickness",1.0)
-        nodes = kwds.get("nodeList", self.G.nodes)
-        figSize = kwds.get("figSize", (10,10))
-        nodeSize = kwds.get("nodeSize", 1.0)
-        ignoreFixed = kwds.get("ignoreFixed", True)
-        title = kwds.get("title",type)
-        
-        #gather stress scalars
-        S = []
-        for N in nodes:
-        
-            if not "stress" in self.G.nodes[N]:
-                self.computeAttributes()
+        #convert keywords to lists as necessary (such that there is a value per plot)
+        if isinstance(attr,str):
+            attr = [attr]
+        if isinstance(title,str):
+            title = [title] * len(attr)
+        if not (isinstance(linewidth,list) or isinstance(linewidth,np.ndarray)):
+            linewidth = [linewidth] * len(attr)
+        if not isinstance(cmap,list):
+            cmap = [cmap] * len(attr)
+        if not isinstance(vmin,list):
+            vmin = [vmin] * len(attr)
+        if not isinstance(vmax,list):
+            vmax = [vmax] * len(attr)
             
-            #ignore fixed
-            if ignoreFixed and '111' in self.G.nodes[N]["TFIXED"]:
-                S.append(0)
-                continue
-                
-            if "sig1" in type:
-                S.append( np.linalg.norm(self.G.nodes[N]["sig1"]) )
-            elif "sig3" in type:
-                S.append( np.linalg.norm(self.G.nodes[N]["sig3"]) )
-            elif "mean" in type or "hyd" in type:
-                S.append( self.G.nodes[N]["meanStress"] )
-            elif "mag" in type:
-                S.append( np.linalg.norm( self.G.nodes[N]["stress"] ) )
-            elif "diff" in type or "dev" in type:
-                S.append( np.linalg.norm( self.G.nodes[N]["deviatoricStress"] ) )
-            elif "sx" in type:
-                S.append( self.G.nodes[N]["stress"][0,1] )
-            elif "sy" in type:
-                S.append( self.G.nodes[N]["stress"][1,0] )
-            elif "nx" in type:
-                S.append( self.G.nodes[N]["stress"][0,0] )
-            elif "ny" in type:
-                S.append( self.G.nodes[N]["stress"][1,1] )
+        #init figure
+        fig, ax = plt.subplots( 1, len(attr), figsize=kwds.get("figsize",(10,10)) )
+        if not isinstance(ax,np.ndarray):
+            ax = [ax]
             
-        #build norm object
-        vmin = kwds.get("vmin",np.min(S))
-        vmax = kwds.get("vmax",np.max(S))
-        norm = kwds.get("norm",matplotlib.colors.Normalize( vmin=vmin, vmax=vmax ))
-        
-        #build plot
-        gs = matplotlib.gridspec.GridSpec(5,2, width_ratios=[25,1])
-        fig = plt.figure( figsize=figSize )
-        ax = [ plt.subplot( gs[:,0] ), plt.subplot( gs[2,1] ) ]
-        
-        #build circles
-        circles = []
-        for i,N in enumerate(nodes):
             
-            #skip fixed
-            if ignoreFixed and '111' in self.G.nodes[N]["TFIXED"]:
-                continue
-                
-            #get colour
-            c = cmap( norm(S[i]) )
+        for pn, name in enumerate(attr):
             
-            #build circle patch
-            ax[0].add_artist(matplotlib.patches.Circle(self.pos[N], 
-                            radius = self.G.nodes[N]["radius"]*nodeSize,
-                            color = c))
+            #get cmap
+            if isinstance(cmap[pn],str):
+                cmap[pn] = plt.get_cmap(cmap[pn])
+
+            #get the values to plot
+            scalar = [] #scalar values to plot
+            ticks = [] #tick orientation vectors to plot
+            hasTicks = False #becomes true if ticks are defined
+            for N in nodes:
+
+                #ignore fixed
+                if kwds.get("ignoreFixed", True) and '111' in self.G.nodes[N]["TFIXED"]:
+                    scalar.append(0)
+                    ticks.append(None)
+                    continue
+
+                #if attr not found, try computing all attributes...
+                if not name in self.G.nodes[N]:
+                    self.computeAttributes()
+
+                #get attribute
+                assert name in self.G.nodes[N], "Error - could not find attribute '%s'" % name
+                A = self.G.nodes[N][name]
+
+                #special case - attribute is text. Try converting to a number... (otherwise an error is thrown).
+                if isinstance(A,str):
+                    A = float(A) 
+
+                #attribute is scalar
+                if isinstance(A,numbers.Number):
+                    scalar.append(A)
+                elif isinstance(A,np.ndarray):
+                    if len(A.shape) == 1: #vector quantity
+                        scalar.append(np.linalg.norm(A))
+                        v2d = np.array([A[0],A[1]]) #throw away 3D info if it exists
+                        ticks.append( v2d / np.linalg.norm(v2d) ) #store normalised tick
+                        hasTicks = True
+                    if len(A.shape) == 2: #tensor quantity
+                        assert A.shape[0] == A.shape[1], "Error - tensors must be square matrices."
+
+                        #compute eigens
+                        eigval, eigvec = np.linalg.eig(A)
+                        idx = eigval.argsort()[::-1]
+                        eigval = eigval[idx]
+                        eigvec = eigvec[:,idx]
+
+                        #store principal eigen as tick
+                        if eigval[0] == 0:
+                            ticks.append(np.zeros(3))
+                        else:
+                            ticks.append(eigvec[0])
+                        hasTicks = True
+
+                        #get scalar
+                        func = kwds.get("func","mag")
+                        if callable(func):
+                            scalar.append( func( A ) ) #custom function passed
+                        elif "sig1" in func:
+                            scalar.append( eigval[0] )
+                        elif "sig3" in func:
+                            scalar.append( eigval[1] )
+                        elif "mean" in func or "hyd" in func:
+                            scalar.append( (eigval[0] + eigval[1]) / 2 )
+                        elif "mag" in func:
+                            scalar.append( np.linalg.norm( A ) )
+                        elif "dif" in func:
+                            scalar.append( np.abs(eigval[0] - eigval[1]) )
+                        elif "xx" in func:
+                            scalar.append( A[0,0] )
+                        elif "yy" in func:
+                            scalar.append( A[1,1] )
+                        elif "xy" in func:
+                            scalar.append( A[0,1] )
+
+            #build norm object
+            if len(scalar) > 0:
+                if vmin[pn] is None:
+                    vmin[pn] = np.min(scalar)
+                if vmax[pn] is None:
+                    vmax[pn] = np.max(scalar)
+                norm = kwds.get("norm",matplotlib.colors.Normalize( vmin=vmin[pn], vmax=vmax[pn] ))
+
+            #do plotting
+            for i,N in enumerate(nodes):
+
+                #skip fixed?
+                if kwds.get("ignoreFixed", True) and '111' in self.G.nodes[N]["TFIXED"]:
+                    continue
+
+                #plot particle
+                if len(scalar) > 0:
+                    #get colour
+                    c = cmap[pn]( norm(scalar[i]) )
+
+                    #build circle patch
+                    ax[pn].add_artist(matplotlib.patches.Circle(self.pos[N], 
+                                    radius = self.G.nodes[N]["radius"]*kwds.get("nodesize", 1.0),
+                                    color = c))
+
+                #build ticks
+                if hasTicks:
+                    top = self.pos[N] + ticks[i][:2] * self.G.nodes[N]["radius"] * kwds.get("tickLength",0.75)
+                    bottom = self.pos[N] - ticks[i][:2] * self.G.nodes[N]["radius"] * kwds.get("tickLength",0.75)
+                    ax[pn].add_artist(matplotlib.patches.Polygon(np.array([[top[0],top[1]],[bottom[0],bottom[1]]]),
+                                                closed=False,
+                                                color=kwds.get('linecolor','w'),
+                                                linewidth=linewidth[pn] ) )
+
+            #set limits
+            minx,maxx,miny,maxy = self.getBounds()
+            ax[pn].set_aspect('equal')
+            ax[pn].set_xlim(minx,maxx)
+            ax[pn].set_ylim(miny,maxy)
+            ax[pn].set_title(title[pn])
+
+            #colorbar
+            #cb1 = matplotlib.colorbar.ColorbarBase(ax[pn*2+1], cmap=cmap,
+            #                        norm=norm,
+            #                        orientation='vertical')
+            #cb1.set_label(kwds.get("label",name))
             
-            #build sigma1 tick
-            sig1M = np.linalg.norm(self.G.nodes[N]["sig1"])
-            if sig1M > 0:
-                sig1 = self.G.nodes[N]["sig1"] / sig1M
-                top = self.pos[N] + sig1[:2] * self.G.nodes[N]["radius"] * tl
-                bottom = self.pos[N] - sig1[:2] * self.G.nodes[N]["radius"] * tl
-                ax[0].add_artist(matplotlib.patches.Polygon(np.array([[top[0],top[1]],[bottom[0],bottom[1]]]),
-                                            closed=False,
-                                            color=kwds.get('linecolor','w'),
-                                            linewidth=tt ) )
-            
-        #set limits
-        minx,maxx,miny,maxy = self.getBounds()
-        ax[0].set_aspect('equal')
-        ax[0].set_xlim(minx,maxx)
-        ax[0].set_ylim(miny,maxy)
-        ax[0].set_title(title)
-        
-        #colorbar
-        cb1 = matplotlib.colorbar.ColorbarBase(ax[1], cmap=cmap,
-                                norm=norm,
-                                orientation='vertical')
-        cb1.set_label('Stress (Pa)')
         fig.tight_layout()
-        
         fig.show()
         return fig,ax
+    
+    
     """
     Plot a histogram showing the net particle accelerations (net forces / particle mass).
     
