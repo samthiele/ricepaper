@@ -52,7 +52,7 @@ class RicePaper:
         self.timestep = 1e-2 #model timestep
         self.file = 0 #index for counting files created
         self.restart=None
-
+        self.cwd = os.getcwd() #store working directory for future reference (avoids a multithreaded nightmare later on...). Dir is hence relative to current wd. 
         
         
     def getAllLines(self):
@@ -65,17 +65,27 @@ class RicePaper:
     Create a model definition file and pass it to the ricebal executable for 
     execution.
     
-    **Arguments**:
-    -saveState = save the model state at the end of the simulation. Default is True.
-    -returnLog = load and return the ricebal log after execution. Default is False.
-    -restart = If not None, a restart file is passed to riceball to restart a saved simulation.
-    -supress = If true, the model defenition file is written, but riceball is not invoked.
+    **Keywords**:
+     -saveState = save the model state at the end of the simulation. Default is True.
+     -returnLog = load and return the ricebal log after execution. Default is False.
+     -restart = If not None, a restart file is passed to riceball to restart a saved simulation.
+     -supress = If true, the model defenition file is written, but riceball is not invoked.
                This is useful if the model files have already been generated and you want to 
                fool ricepaper into thinking they have been freshly minted.
-    -printTiming = If True, the time taken to run riceball is printed to the console. Default is True. 
-    **Returns**: 0 if riceball executes succesfully, or the log if returnLog is True.
+     -printTiming = If True, the time taken to run riceball is printed to the console. Default is True. 
+    
+    **Returns**: 
+     - 0 if riceball executes succesfully, or the log if returnLog is True.
     """
-    def execute(self,saveState=True,returnLog=False,restart=None,suppress=False,printTiming=True):
+    def execute(self,**kwds):
+        
+        #get kwds
+        saveState = kwds.get("saveState",True)
+        returnLog = kwds.get("returnLog",False)
+        restart = kwds.get("restart",None)
+        suppress = kwds.get("suppress",False)
+        printTiming = kwds.get("printTiming",True)
+        
         #check output directory exists
         if not os.path.exists(self.dir):
             os.makedirs(self.dir)
@@ -111,16 +121,15 @@ class RicePaper:
         #run executable
         state = 0
         if not suppress:
-            cd = os.getcwd()
             state = subprocess.call(["ricebal5.8a"],shell=True,cwd=self.dir) #call riceball
-            os.chdir(cd)
+            os.chdir(self.cwd) #restore working directory
             
         self.clear() #clear lines that have now been run
         self.restart = "state_%d.sav" % self.file #store link to restart file
 
         #print time
         if printTiming and not suppress:
-            print("RiceBall execution finished in %.2f minutes." % ((time.time()-t0) / 60))
+            print("'%s' finished in %.2f minutes." % (self.dir, (time.time()-t0) / 60))
             
         if returnLog:
             if os.path.exists("trubalw.out"):
@@ -129,6 +138,38 @@ class RicePaper:
                 f.close()
                 return lines #echo lines
         return state #return state of program (0 for success)
+    
+    """
+    Repeatedly cycle the model until the average particle kinitic energy drops below the specified threshold.
+    
+    **Arguments**:
+     - step = the number of seconds to cycle for before stopping and checking the kinetic energy.
+     - thresh = the threshold kinetic energy (in J). Once average energy is less than this, the model is stopped.
+    
+    **Keywords**:
+     - see execute( ... )
+    """
+    def executeToStability(self,step=10,thresh=1.0, **kwds):
+        #do simulation
+        avgK = thresh+1 #> thresh
+        t0 = time.time()
+        while avgK > thresh: #while average particle kinetic energy > 1 J
+        
+            #run one step
+            self.cycle(step)
+            self.execute(**kwds)
+            
+            #load output and check kinetic energy
+            M = self.loadLastOutput() #load last output to check if model has reached stability
+            id,K = M.getAttributes(["kin"]) #get average kinetic energy
+            avgK = np.mean(K)
+            
+            if kwds.get("printTiming",True):
+                print ("Average kinetic energy = %E" % avgK)
+                
+        if kwds.get("printTiming",True):
+            print("Model equilibrated in %f minutes" % ((time.time()-t0) / 60))
+    
     """
     Clear the cached commands in this RicePaper object. This is also called after every execute() command.
     """
@@ -183,34 +224,32 @@ class RicePaper:
     Loads the last output file created the last time execute() was run. 
     """
     def loadLastOutput(self):
-        cwd = os.getcwd()
-        os.chdir(self.dir) #move into output dir
-        fname = "Step%03d.out" % self.file
+        fname = os.path.join(self.dir,"Step%03d.out" % self.file) #calculate filename
         assert os.path.exists(fname), "Error: no ouput file %s found" % fname
         model = RiceBall(fname,radii=self.radii,density=self.density)
-        os.chdir(cwd)
         return model
         
     """
     Loads the output associated with a particular step (as returned by the cycle() command) or list of steps.
     
+    **Arguments**:
+     - steps = a list of the step indices (1 to n; as returned by *cycle(...)*). If None is passed,
+               all avaliable steps are loaded (or attempted to..). Default is None. 
     **Returns**:
     -The requested model or list of models as RiceBall classes.
     """
-    def loadSteps(self,steps):
+    def loadSteps(self,steps=None):
         out = []
         if isinstance(steps,int):
             steps = [steps]
-        
-        cwd = os.getcwd()
-        os.chdir(self.dir) #move into output dir
+        if steps is None:
+            steps = list(range( len(self.step)) )
         
         for s in steps:
-            fname = "Step%03d.out" % s
+            fname = os.path.join(self.dir,"Step%03d.out" % s)
             assert os.path.exists(fname), "Error: no ouput file %s found" % fname
             out.append(RiceBall(fname,radii=self.radii,density=self.density))
-        os.chdir(cwd)
-        
+
         if len(out) == 1:
             return out[0]
         else:
@@ -481,7 +520,7 @@ class RicePaper:
         n = np.linalg.norm(np.array(start) - np.array(end)) / D
         
         #write
-        self.lines.append("LIN %d %f %f %f %f %f %f %d %d\n" % (n,start[0],start[1],start[2],end[0],end[1],end[2],size_class,surface_class))
+        self.lines.append("LIN %d %.2f %.2f %.2f %.2f %.2f %.2f %d %d\n" % (n,start[0],start[1],start[2],end[0],end[1],end[2],size_class,surface_class))
     
     """
     Play god and change gravity
@@ -650,22 +689,46 @@ class RicePaper:
     **Arguments**:
     -pos1 = the position of the first particle to bond.
     -pos2 = the position of the second particle to bond.
+    -e = the error margin to add on each side of the particles to bond. Default is 0.1.
+    -moments = True if bonds that transmit moments are created. Default is False. 
     """
-    def makeBond(self,pos1,pos2,e=0.1):
+    def makeBond(self,pos1,pos2,e=0.1,moments=False):
         #set bounds
         x = np.array([pos1[0],pos2[0]])
         y = np.array([pos1[1],pos2[1]])
-        self.lines.append("DOB %d,%d,%d,%d,0,100\n" % (min(x)-e,
+        self.lines.append("**Bond two adjacent particles**\n") 
+        self.lines.append("DOB %.2f %.2f %.2f %.2f 0 %.2f\n" % (min(x)-e,
                                                      max(x)+e,
                                                      min(y)-e,
-                                                     max(y)+e))
+                                                     max(y)+e,
+                                                     self.bounds[2]))
         
         #compute distance between points
         dist = e + np.linalg.norm(x-y)
         
         #make bonds
-        self.lines.append("MKbonds %.2f all\n" % dist)
+        if moments:
+            self.lines.append("MKMbonds %.2f all\n" % dist)
+        else:
+            self.lines.append("MKBonds %.2f all\n" % dist)
     
+    """
+    Bonds all particles in the model that are within the specified radius of each other.
+    
+    **Arguments**:
+     - radius = the radius within wich to bond particles. 
+     - moments = true if bonds should transmit moments. Default is False. 
+    """ 
+    def makeBonds(self,radius, moments=False):
+        
+        self.lines.append("\n**Bond particles within radius %.2f**\n" % radius)
+        self.lines.append("DOB 0 %f 0 %f 0 %f\n" % (self.bounds[0],self.bounds[1],self.bounds[2]))
+        
+        if moments:
+            self.lines.append("MKMbonds %.2f all\n" % radius)
+        else:
+            self.lines.append("MKBonds %.2f all\n" % radius)
+        
     """
     Submit a custom command to the model definition file.
     
@@ -762,14 +825,12 @@ class RicePaper:
 Quick and dirty multithreading tool for executing multiple riceball projects at once.
 
 **Arguments**:
--projects = a list of the projects to run in parallel. These must all operate from different projects. 
--saveState = Should each project save it's state at the end of the job? Default is True.
--verbose = True if a printout should be given each time a thread is finished.
--supress = If true, the model defenition file is written, but riceball is not invoked.
-               This is useful if the model files have already been generated and you want to 
-               fool ricepaper into thinking they have been freshly minted. 
+-projects = a list of the projects to run in parallel. These must all operate from different directories. 
+
+**Keywords**:
+ - keywords are passed to each ricepaper.execute(...) function. 
 """
-def multiThreadExecute( projects,saveState=True,verbose=True,suppress=False):
+def multiThreadExecute( projects,**kwds):
     import multiprocessing
     from threading import Thread
     from time import sleep
@@ -780,11 +841,11 @@ def multiThreadExecute( projects,saveState=True,verbose=True,suppress=False):
     while not (len(waiting) == 0 and len(active) == 0): #While there are jobs still to run/running?
         if len(active) < nCores and len(waiting) > 0: #are there free cores? Jobs still to run?
             job=waiting.pop() #get next job (n.b. this automatically removes it from the set)
-            T = Thread(target=job.execute,args=(saveState,False,None,suppress)) #create thread for next job #args = saveState=True,returnLog=False,restart=None,suppress=False
+            T = Thread(target=job.execute,kwargs=kwds) #create thread for next job
             T.start() #spawn thread
             active.add(T) #add to active thread list
             
-            if verbose:
+            if kwds.get("verbose",True):
                 print("Launching job %d of %d." % ((len(projects) - len(waiting)),len(projects)))
             sleep(0.1) #give the computer a chance to launch this thread succesfully (avoids issues when python is asked to be in multiple working dirs concurrently)
             continue #skip to next loop, in case active set isn't full yet

@@ -7,8 +7,11 @@ Sam Thiele 2018
 """
 
 import numpy as np
+import ricepaper
 from ricepaper import RicePaper
 from ricepaper.utils import *
+import matplotlib.pyplot as plt
+
 class NodeSet:
     
     """
@@ -57,24 +60,30 @@ class NodeSet:
         self.R = None
         
     """
-    Define properties of frictional contacts between particles.
+    Define frictional of contacts between particles.
     
     **Arguments**:
         -friction = [n x n] array where element [i,k] contains the friction coefficient between particles of type i and k If a single value is passed this is value is applied to all possible contacts.
-        -cohesion = [n x n] array where element [i,k] contains the cohesion (in newtons) between particles of type i and k. If a single value is passed this is value is applied to all possible contacts.
     """
-    def setFriction( self, friction, cohesion ):
+    def setFriction( self, friction ):
         if not isinstance(friction,list):
             friction = np.zeros( [self.ntypes,self.ntypes] ) + friction
-        if not isinstance(cohesion,list):
-            cohesion = np.zeros( [self.ntypes,self.ntypes] ) + cohesion
     
         assert friction.shape == self.friction.shape, "Invalid friction array: required dimensions [%d x %d]" % (self.ntypes,self.ntypes)
-        assert cohesion.shape == self.cohesion.shape, "Invalid cohesion array: required dimensions [%d x %d]" % (self.ntypes,self.ntypes)
-        
         self.friction = np.array(friction)
-        self.cohesion = np.array(cohesion)
+
+    """
+    Define cohesion of contacts between particles.
     
+    **Arguments**:
+        -cohesion = [n x n] array where element [i,k] contains the cohesion (in newtons) between particles of type i and k. If a single value is passed this is value is applied to all possible contacts.
+    """
+    def setCohesion( self, cohesion ):
+        if not isinstance(cohesion,list):
+            cohesion = np.zeros( [self.ntypes,self.ntypes] ) + cohesion
+        assert cohesion.shape == self.cohesion.shape, "Invalid cohesion array: required dimensions [%d x %d]" % (self.ntypes,self.ntypes)
+        self.cohesion = np.array(cohesion)
+        
     """
     Define bond stiffness between particles. 
     
@@ -106,10 +115,21 @@ class NodeSet:
         self.sStrength = np.array(sStrength)
     
     """
+    Constructs bonds between particles based on their (current) location.
+    
+    **Keywords**:
+     -radius = the radius to search for neighbouring particles to bond with. Defualt is 1.25 * the maximum particle radius. 
+     -moments = true if bonds that transmit moments should be created. Default is False. 
+    """
+    def bond( self, **kwds ):
+        
+        r = kwds.get("radius",np.max(self.radii)*1.25)
+        self.R.makeBonds(radius = r, moments = kwds.get("moments",False))
+        
+    """
     Deposit particles of this material type and let it settle until it reaches equilibrium. 
     
     **Arguments**:
-        -n = the total number of particles to generate
         -l = the length of the domain to loosly fill with particles before gravity settling. 
         -h = the height of the domain to fill with particles before gravity settling.
     **Keywords**:
@@ -122,7 +142,7 @@ class NodeSet:
         -base = the width of the base. If this is larger than l, conical piles will be generated. Default is base = l. 
         -tStep = the timestep to use for the simulation. Default is 0.005 seconds. 
         -stepSize = the model time (in seconds) to run the model for before checking if it has reached stability. Default is 60. 
-        -nLayers = the number of layers (different colours) to generate. Default is 4. 
+        -nlayers = the number of layers (different colours) to generate. Default is 4. 
         -pcolor = primary layer colour. Default is green.
         -acolor = alternate layer colour. Default is blue. 
         -verbose = True if output is printed to console. Default is true.
@@ -144,13 +164,12 @@ class NodeSet:
         base = kwds.get("base",l)
         assert base >= l, "Error - base must be greater or equal to l."
         
-        frequency = np.array(kwds.get("frequency",[1/self.ntypes]*self.ntypes))
+        frequency = kwds.get("frequency",[1/self.ntypes]*self.ntypes)
         if not isinstance(frequency[0],list): #frequency is the same for each layer 
             frequency = [frequency] * nLayers 
-        assert len(frequency) == nLayers, "Error - particle frequencies need to be specified for each layer."
         for i,freq in enumerate(frequency):
-            assert len(freq) == self.ntypes, "Error - a frequency has not been provided for all particle types."
-            frequency[i] = freq / np.sum(freq) #normalise such that sum of frequencies = 1 for each layer
+            assert len(freq) == self.ntypes, "Error - a frequency has not been provided for all %d particle types." % self.ntypes
+            frequency[i] = np.array(freq) / np.sum(freq) #normalise such that sum of frequencies = 1 for each layer
         
         self.walltype = walltype
         assert self.walltype <= self.ntypes, "Error - the specified particle type does not exist."
@@ -160,7 +179,6 @@ class NodeSet:
         
         tstep = kwds.get("tstep",0.005)
         assert tstep > 1e-9 and tstep < 1, "Error - stop passing stupid timesteps..."
-        
         
         
         #start model
@@ -235,19 +253,10 @@ class NodeSet:
             for i in range(self.ntypes):
                 self.R.genBalls( n * frequency[q][idx[i]], idx[i]+1, idx[i]+1, c )
         
-        #do simulation
-        avgK = 100000
-        while avgK > 1: #while average particle kinetic energy > 1 J
-            self.R.cycle(stepSize) #run for period of time (default is 1 min)
-            self.R.execute(suppress=kwds.get("suppress",True))
-            M = self.R.loadLastOutput() #load last output to check if model has reached stability
-            id,K = M.getAttributes(["kin"]) #get average kinetic energy
-            avgK = np.mean(K)
-            print ("Average kinetic energy = %E" % avgK)
-            
-        print("Model equilibrated")
+        #run simulation to stability
+        self.R.executeToStability(stepSize,thresh=1.0,**kwds)
+                
         return self.R #return ricepaper instance
-    
     
     #private functions
     """
@@ -282,3 +291,381 @@ class NodeSet:
                     R.setCohesion(i+1,n+1,self.cohesion[i,n])
                     R.setBond(i+1,n+1, self.nStiff[i,n], self.sStiff[i,n], self.tStrength[i,n], self.sStrength[i,n] )
                     R.custom("") #newline
+                
+
+"""
+Class for constructing mechanical tests , executing them (in serial or in parallel), processing 
+and visualising the results. 
+"""
+class MechLab:
+    
+    """
+    Utility class for storing test properties. 
+    """
+    class Test:
+        """
+        Init test properties class and populate basic properties. 
+        
+        **Arguments**:
+         - testName = the name of this test. Should reflect the location of the output.
+         - testType = the type of this test. Should be "shear" or "compression" or "extension".
+         - lab = the MechLab object that created this test.        
+         - R = the ricepaper object that implements this test. 
+        """
+        def __init__( self, testName, testType, lab, R ):
+            self.name = testName
+            self.type = testType
+            self.lab = lab
+            self.R = R
+            self.steps = [] #execution steps will be stored here. 
+            
+            #define default test params (these will be overwritten when changed)\
+            self.xvel = 0.5
+            self.yval = 0.5
+            self.confining = 0 #confining/normal stress applied to top platen during shear and compression tests
+            self.initSteps = 0
+            self.testSteps = 0
+            self.initial_height = lab.upper - lab.lower
+            self.initial_width = lab.init_xmax - lab.init_xmin
+            
+            self.models = None
+            
+            
+        """
+        Load test results and do stress/strain calcs etc. 
+        """
+        def load_results(self):
+            if not self.models is None:
+                return #no need to recalculate
+            #calculate time at each step and xvelocity at each step
+            self.time = np.linspace(0,(self.initSteps+self.testSteps)*self.lab.stepSize,self.initSteps+self.testSteps)
+            
+            #calculate shear strain at each step (from displacement)
+            t = np.linspace(0,self.testSteps*self.lab.tstep,self.testSteps)
+            self.shear_strain = np.append([0]*self.initSteps, 
+                        np.rad2deg(np.arctan((t*self.xvel)/self.initial_height)))
+
+            #loop through steps and calculate stresses and strains
+            self.shear_stress = []
+            self.normal_stress = []
+            self.compressive_stress = []
+            self.sample_stress = []
+            self.sample_width = [] #change in sample width will be meaningless for shear tests.
+            self.sample_height = []
+            
+            self.models = self.R.loadSteps(self.steps)
+            for m in self.models:
+                
+                #***************************
+                #get sample dimensions
+                #***************************
+                xmin,xmax,ymin,ymax = m.getBounds(dynamic=True)
+                self.sample_width.append(xmax-xmin) #n.b. this will be invalid for shear-tests
+                self.sample_height.append(ymax-ymin)
+                
+                #****************************
+                #Estimate boundary stress
+                #****************************
+                pid,F = m.getAttributes(["force"],onlyFixed=True,gravity=np.array([0,0,0]))
+                f_top = np.array([0.0,0.0,0.0])
+                f_side = np.array([0.0,0.0,0.0])
+                for i,f in enumerate(F):
+                    #sum over top platen (for shear tests)
+                    if m.pos[pid[i]][1]>self.lab.upper-np.max(self.lab.mat.radii)*4 and int(m.G.nodes[pid[i]]["MTYPE"]) != self.lab.mat.walltype:
+                        f_top += f
+                    #sum over right platen (for compression tests)
+                    if m.pos[pid[i]][0] > xmax - np.max(self.lab.mat.radii)*4 and int(m.G.nodes[pid[i]]["MTYPE"]) == self.lab.mat.walltype:
+                        f_side += f
+                
+                #store shear-box stresses
+                self.shear_stress.append( -f_top[0] / self.lab.platen_area)
+                self.normal_stress.append( f_top[1] / self.lab.platen_area)
+                
+                #store compression test stressess
+                self.compressive_stress.append( f_side[0] / ((self.lab.upper - self.lab.lower)*2*np.max(self.lab.mat.radii) ))
+                
+                #***************************
+                #Estimate sample stress
+                #***************************
+                #n.b. all tests are conducted on the international space station, so there is no gravity :-) 
+                pid,S,vol = m.getAttributes(["stress","volume"],ignoreFixed=True,gravity=np.array([0,0,0]))
+                S_sum = np.zeros((2,2))
+                for i,s in enumerate(S):
+                    S_sum += s*vol[i]
+                if self.type == "shear":
+                    self.sample_stress.append(S_sum / (self.lab.platen_area*(ymax-ymin)))
+                else:
+                    self.sample_stress.append(S_sum / ((xmax-xmin)*(ymax-ymin)*2*np.max(self.lab.mat.radii))) #will be wrong under shear as sample no longer rectangular
+            
+            #store data as np arrays
+            self.shear_stress = np.array(self.shear_stress)
+            self.normal_stress = np.array(self.normal_stress)
+            self.sample_width = np.array(self.sample_width) #change in sample width will be meaningless for shear tests.
+            self.sample_height = np.array(self.sample_height)
+            self.compressive_stress = np.array(self.compressive_stress)
+    """
+    Initialise this test and specify initial platen positions
+    
+    **Arguments**:
+     - mat = the NodeSet making the material being tested. A particle assembalage must have been
+                  already constructed using this (with "gravityDeposit").
+    
+    **Keywords**:
+     -lower = the height of the lower platen above the base of the material domain. Default is 10%. 
+     -upper = the height of the top platen above the base of the material domain. Default is 75%.
+     -tStep = the timestep to use for the simulation. Default is 0.005 seconds. 
+     -stepSize = the time (in seconds) to run the model for at each increment. Default is 5 seconds.
+     -initTime = number of seconds to run the model before shearing (to reach target normal stress). Default is 10 seconds.
+     -testTime = time to run the experiment for (excluding the initialisation!). Default is 50 seconds. 
+    """
+    def __init__( self, mat, **kwds ):
+        self.mat = mat
+        assert mat.R != None, "Please generate a material (e.g. using gravityDeposit(...)) first."
+        
+        #bind material (for reference largely, and in case properties have been changed)
+        self.mat._bindPropsToModel()
+            
+            
+        #get platen positions
+        self.upper = kwds.get("upper",mat.height / 2)
+        self.lower = kwds.get("lower",mat.height / 20)
+        assert self.upper - self.lower > np.max(mat.radii), "Error - Lower surface must be (significantly) below upper surface..."
+        
+        #get step properties
+        self.stepSize = kwds.get("stepSize",5)
+        self.initTime = kwds.get("initTime",10)
+        self.testTime = kwds.get("testTime",50)
+        
+        #get timestep
+        self.tstep = kwds.get("tstep",0.005)
+        assert self.tstep > 1e-9 and self.tstep < 1, "Error - stop passing stupid timesteps..."
+        
+        #get initial sample bounds (n.b. the height is the total sample, not just the bit between the platens)
+        m = mat.R.loadLastOutput()
+        self.init_xmin,self.init_xmax,self.init_ymin,self.init_ymax = m.getBounds(dynamic=True)
+        assert self.init_ymin < self.lower, "Error - lower platen does not intersect particles."
+        assert self.init_ymax > self.upper, "Error - upper platen does not intersect particles."
+        
+        #calculate platen area
+        self.platen_area = (self.init_xmax - self.init_xmin) * 2 * np.max(self.mat.radii)
+        
+        #initialise test queue
+        self.tests = []
+    
+    """
+    Create a shearTest and add it to the execution queue.  
+    
+    **Arguments**:
+     - normal_stress = the confining (normal) stress to apply during the shear box test.
+     - shear_velocity = the velocity of the upper plate of the shear experiment. The lower plate is fixed. 
+    
+    **Keywords**:
+     -yvel = the maximum velocity of the upper platen in the y-directions (limits response to changes 
+              in normal stress. Default is 0.5 m/sec. 
+     -bond = True if bonds should be generated before executing the test. Default is True. 
+    """
+    def addShearTest(self, normal_stress, shear_velocity, **kwds  ):
+        #clone ricepaper interface
+        name = "%s/shear_test/%d_Pa" % (self.mat.name,normal_stress)
+        R = self.mat.R.clone(name)
+        
+        #create new test
+        T = MechLab.Test( name, "shear", self, R)
+        
+        #store test params
+        T.confining = normal_stress
+        T.xvel = shear_velocity
+        T.yvel = kwds.get("yvel",0.5)
+        
+        ##############################################
+        #remove wall and base particles from model
+        ##############################################
+        R.custom("\n\n**Delete walls created during gravity deposition**")
+        walld=self.mat.radii[self.mat.walltype-1]*2
+        
+        #delete left wall
+        R.setDomain( 0, self.init_xmin, 0, self.mat.height, 0,  self.mat.depth )
+        R.custom("PRP 1 EROd %d\n" % self.mat.walltype)
+        
+        #delete right wall
+        R.setDomain( self.init_xmax, self.mat.width, 0, self.mat.height, 0,  self.mat.depth )
+        R.custom("PRP 1 EROd %d\n" % self.mat.walltype)
+        
+        #delete base
+        R.setDomain( 0, self.mat.width, 0, self.init_ymin, 0,  self.mat.depth )
+        R.custom("PRP 1 EROd %d\n" % self.mat.walltype)
+        
+        ##############################
+        #turn of gravity and bond
+        ##############################
+        R.setGravity((0,0,0))
+        R.setNumericalProperties(timestep=self.tstep)
+        if kwds.get("bond",True):
+            R.makeBonds(np.max(self.mat.radii)*1.25,moments=kwds.get("moments",False))
+        
+        ##############################
+        #setup shear box
+        ##############################
+        R.custom("\n\n********************")
+        R.custom("**Setup shear test**")
+        R.custom("********************")
+        R.custom("Wall Pos %.3f %.3f" % (self.upper,self.lower)) #set position of platens
+        R.custom("Wall Nstress %.3f" % (normal_stress)) #set normal stress
+        R.custom("Wall Gain %E" % (1e-5)) #set large number for servo gain (we use velocity as the limit)
+        R.custom("Wall Vel %.3f" % T.yvel) #set maximum normal velocity 
+        
+        #################################################################
+        #setup init phase (compress until we reach desired normal stress)
+        #################################################################
+        R.custom("Wall Xvel 0 0") #zero shear velocity
+        T.initSteps = int(self.initTime / self.stepSize)
+        for i in range(T.initSteps):
+            T.steps.append( R.cycle(self.stepSize) )
+        
+        ##################
+        #setup shear phase
+        ##################
+        R.custom("Wall Xvel %.3f 0" % (shear_velocity)) #set shear velocity
+        T.testSteps = int(self.testTime/self.stepSize)
+        for i in range(T.testSteps):
+            T.steps.append( R.cycle(self.stepSize) )
+            
+        #store test and return 
+        self.tests.append( T )
+        
+        return T
+    
+    """
+    Plot the results of the shearbox experiments.
+    
+    **Arguments**:
+     - detailed = If true, detailed stress plots for each sample are plotted, as well as the overall mohr-coloumb failure envelope.
+                  If false, only the failure envelope is plotted. 
+    """
+    def plotShearResults( self, detailed = True, **kwds ):
+        maxS = [] #maximum shear stress
+        NS = [] #applied normal stresses (75th percentile, though should be quite constant)...
+        for T in self.tests:
+            if T.type != "shear":
+                continue
+            
+            #make sure results have been loaded
+            T.load_results()
+            
+            #extract maxima
+            maxS.append(np.max(T.shear_stress))
+            NS.append(np.percentile(T.normal_stress,75))
+            
+            #setup fig
+            fig,ax = plt.subplots(1,3,figsize=(20,5))
+
+            #plot time-strain curve
+            #time = np.array(list(range(0,len(strain))))*kwds["stepSize"]
+            ax[0].plot(T.time,T.shear_stress/1e6,color="blue",label="shear stress")
+            ax[0].plot(T.time,T.normal_stress/1e6,color="red",label="normal stress")
+            ax[0].axhline(NS[-1]/1e6,color='red')
+            ax[0].set_title("Platen Stresses")
+            ax[0].set_xlabel("Time (seconds)")
+            ax[0].set_ylabel("Stress (MPa)")
+            ax[0].legend()
+
+            #get stress in sample
+            smax = []
+            nmax = []
+            for s in T.sample_stress:
+                #calculate principal stresses
+                eigval, eigvec = np.linalg.eig(s)
+                idx = eigval.argsort()[::-1]
+                eigval = eigval[idx]
+                eigvec = eigvec[:,idx]
+
+                smax.append(0.5 * np.abs(eigval[0]-eigval[1]))
+                nmax.append(0.5 * np.abs(eigval[0] + eigval[1]))
+                
+            ax[1].plot(T.time,np.array(smax)/1e6,color='blue',label="shear stress")
+            ax[1].plot(T.time,np.array(nmax)/1e6,color='red', label="normal stress")
+            ax[1].set_title("Sample Stresses")
+            ax[1].set_xlabel("Time (seconds)")
+            ax[1].set_ylabel("Stress (MPa)")
+            ax[1].legend()
+
+            #plot broken bonds
+            x = list(range(0,len(T.models)))
+            tensile = []
+            shear = []
+            for m in T.models:
+                tcount = 0
+                scount = 0
+                for b in m.brk:
+                    if b[0] == 'Tensile Failure':
+                        tcount+=1
+                    elif b[0] == 'Shear Failure':
+                        scount+=1
+                    elif b[0] == 'Tens-shear Failure':
+                        scount+=1
+                        tcount+=1
+                    else:
+                        print(b)
+                        assert False
+                tensile.append(tcount)
+                shear.append(scount)
+            ax[2].plot(T.time,tensile,color='b',label="tensile")
+            ax[2].set_ylabel("tensile bond failures",color="b")
+            ax2 = ax[2].twinx()
+            ax2.plot(T.time,shear,color='g',label="shear")
+            ax2.set_ylabel("shear bond failures",color="g")
+            ax[2].set_title("Broken Bonds")
+            ax[2].set_xlabel("Time (seconds)")
+            fig.suptitle("Shear test at %d MPa normal stress" % (T.confining/1e6))
+            fig.show()
+
+        #plot Coloumb failure line
+        if len(NS) > 1: #can't do for only one test..
+            plt.figure()
+            x = np.array(NS) / 1e6
+            y = np.array(maxS) / 1e6
+            plt.scatter(x,y,color='b')
+            k,m = np.polyfit(x,y,1)
+            plt.plot([0,np.max(x)+5],[m,(np.max(x)+5)*k+m],color='k')
+            plt.text(0.95,0.1,"cohesion=%.2f MPa" % m,transform=plt.gca().transAxes,horizontalalignment='right')
+            plt.text(0.95,0.05,"friction angle=%.2f°" % np.rad2deg(np.arctan(k)),transform=plt.gca().transAxes,horizontalalignment='right')
+
+            plt.xlim(0,np.max(x)+5)
+            plt.ylim(0,np.max(y)+5)
+            plt.ylabel("Shear Stress (MPa)")
+            plt.xlabel("Normal Stress (MPa)")
+            plt.show()
+
+    def writeToVTK(self):
+        #calculate strain and export to VTK
+        for T in self.tests:
+            T.load_results()
+            
+            #calc strain and export to vtk
+            for t in range(1,len(T.models)):
+                T.models[t].computeStrain2D(T.models[t-1]) #compute strain
+                T.models[t].averageAttr("stress",n=5) #average stress field
+                T.models[t].averageAttr("strain",n=2)
+                T.models[t].writeVTK("%s/STEP_%03d.vtk" % (T.name,t+1)) #export 
+        
+        
+        
+    """
+    Run all tests.
+    
+    **Arguments**:
+     -multiThreaded = True if tests should be executed in separate threads. Default is true. 
+    
+    **Keywords**: All keywords are passed to RicePaper execute(...). 
+    """
+    def runTests(self, multiThreaded=True, **kwds):
+        #gather list
+        q = []
+        for T in self.tests:
+            if not multiThreaded:
+                T.R.execute(**kwds)
+            else:
+                q.append(T.R)
+                
+        if multiThreaded:
+            ricepaper.multiThreadExecute(q,**kwds)                

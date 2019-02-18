@@ -115,15 +115,15 @@ class RiceBall:
             if not self.radii is None:
                 sID = int(self.G.nodes[nID]["STYPE"])
                 assert sID in self.radii, "Error - unexpected STYPE found. Check %d is in radii dict." % sID
-                self.G.nodes[nID]["radius"] = self.radii[sID]
-                self.G.nodes[nID]["volume"] = (self.radii[sID]**3) * (4/3) * np.pi
+                self.G.nodes[nID]["radius"] = float(self.radii[sID])
+                self.G.nodes[nID]["volume"] = float((self.radii[sID]**3) * (4/3) * np.pi)
             #get node mass and volume 
             if not self.density is None:
                 mID = int(self.G.nodes[nID]["MTYPE"])
                 if mID == 0: #special case -> contains wall nodes
                     self.density[mID] = 2500 #assign arbitrary density
                 assert mID in self.density, "Error - unexpected MTYPE found. Check %d is in radii dict." % mID
-                self.G.nodes[nID]["mass"] = self.density[mID]*self.G.nodes[nID]["volume"]
+                self.G.nodes[nID]["mass"] = float(self.density[mID]*self.G.nodes[nID]["volume"])
                 
         #finally, add edge data
         header = getHeader(data[lineNum])
@@ -141,21 +141,22 @@ class RiceBall:
             attributes = {}
             for i,column in enumerate(header):
                 attributes[column] = dataLine[i]
+            
+            #check both nodes in edge have been defined (occasionally, during testing, edges are exported even though particles are outside the model domain).
+            if (int(attributes["BALL1"]) in self.G) and (int(attributes["BALL2"]) in self.G):
+            
+                #add attribute describing magnitude of shear stress
+                attributes["Fs"] = np.linalg.norm( np.array( [float(attributes["FS.x"]),float(attributes["FS.y"])]))
                 
-            #add attribute describing magnitude of shear stress
-            attributes["Fs"] = np.linalg.norm( np.array( [float(attributes["FS.x"]),float(attributes["FS.y"])]))
-            
-            
-            #add edge
-            self.G.add_edge(int(attributes["BALL1"]),int(attributes["BALL2"]),**attributes)
-            
-            #calculate magnintude of shear stress?
-            
+                
+                #add edge
+                self.G.add_edge(int(attributes["BALL1"]),int(attributes["BALL2"]),**attributes)
+
             
         #is there associated bond breakage data?
+        self.brk = [] #store breakage data such that each row corresponds to a breakage event
         bfile = os.path.splitext(file)[0] + ".bnd"
         if os.path.isfile(bfile):
-            self.brk = [] #store breakage data such that each row corresponds to a breakage event
             f = open(bfile,"r")
             lines = f.readlines()
             header = getHeader(lines[0])
@@ -164,7 +165,6 @@ class RiceBall:
                 data[1] = "%s %s" % (data[0],data[1]) #concatenate first two lines
                 #store data
                 self.brk.append(data[1:]) #store
-
         
     """
     Returns the number of balls in this model step 
@@ -322,7 +322,7 @@ class RiceBall:
             
             T = [ np.array([0,0,0]) ] #init torque to zero
             F = [ gravity * self.G.nodes[N]["mass"] ] #init force to gravity
-            S = np.zeros([3,3]) #init null stress tensor 
+            S = np.zeros([2,2]) #init null stress tensor 
                     
             for e in self.G.edges(N,data=True):
                 #get position of second particle
@@ -355,8 +355,8 @@ class RiceBall:
                 F.append(f)
                 
                 #accumulate stress tensor
-                for u in range(3):
-                    for v in range(3):
+                for u in range(2):
+                    for v in range(2):
                         S[u][v] += R[u]*f[v]
                         
                 #store per-contact vectors for future use/export
@@ -388,12 +388,11 @@ class RiceBall:
                 eigvec = eigvec[:,idx]
                 
                 #calculate deviatoric stresses (n.b. 2D case only!)
-                Sm = np.mean( [eigval[0],eigval[1]] )
-                self.G.nodes[N]["deviatoric_stress"] = S - np.array( [[Sm,0,0],
-                                                                      [0,Sm,0],
-                                                                      [0,0, 0]] )
+                Sm = np.mean( [S[0,0],S[1,1]] )
+                self.G.nodes[N]["deviatoric_stress"] = S - (np.eye(2) * Sm)
+                
             else: #special case for fixed nodes - write null stress tensors (as stress calculation will be garbage)
-                S = np.zeros([3,3])
+                S = np.zeros([2,2])
                 self.G.nodes[N]["deviatoric_stress"] = S
             
             #calculate resultant force and torque and associated accelerations
@@ -467,7 +466,13 @@ class RiceBall:
             
             #store invariants
             self.G.nodes[N]["J"] = np.linalg.det(F) #volumetric strain/jacobian
-            self.G.nodes[N]["deviatoric_strain"] = S - np.array([[np.mean(eigval),0],[0,np.mean(eigval)]])
+            
+            
+            #calculate deviatoric stresses (n.b. 2D case only!)
+            Sm = np.mean( [S[0,0],S[1,1]] )
+            self.G.nodes[N]["deviatoric_strain"] = S - (np.eye(2) * Sm)
+                                                                  
+            #self.G.nodes[N]["deviatoric_strain"] = S - np.array([[np.mean(eigval),0],[0,np.mean(eigval)]])
     
     """
     Computes the displacements between matching particles relative to the reference (prior-state) model.
@@ -530,7 +535,7 @@ class RiceBall:
             if weighted:
                 self.G.nodes[N][attr] = np.average(A, weights = vol / np.sum(vol), axis=0 )
             else:
-                self.G.nodes[N][attr] = np.average(A)
+                self.G.nodes[N][attr] = np.average(A, axis=0 )
            
         #recurse?
         if n > 1:
@@ -625,9 +630,9 @@ class RiceBall:
         index = {} #dict linking node id's to local indices
         
         #define attributes to ignore (these are largely junk loaded from the .OUT files)
-        ignoreFilter = ["ADDRESS", 
+        ignoreFilter = ["ADDRESS", "WINDOW",
                         "U.x","U.y","U.z",
-                        "FSUM.x", 'FSUM.y', 'FSUM.z'
+                        "FORCE.z","FSUM.x", 'FSUM.y', 'FSUM.z'
                         'MSUM.x', 'MSUM.y', 'MSUM.z']
 
         #gather data and write geometry (but not data yet) 
@@ -647,6 +652,8 @@ class RiceBall:
                 if key in ignoreFilter or "\n" in key:
                     continue
                 #store
+                if isinstance(value,str):
+                    value = float(value)
                 if key in data:
                     data[key].append(value)
                 else:
@@ -674,7 +681,6 @@ class RiceBall:
             #store data
             for key,value in e[2].items():
                 #is key in the ignore list
-                
                 if key in ignoreFilter or "\n" in key:
                     continue
                 #store
@@ -715,12 +721,12 @@ class RiceBall:
                     for v in vals:
                         f.write("%f %f %f\t" % (v[0],v[1],v[2]))
                 #3D Tensor
-                if vals[0].shape == (3,3):
+                if vals[0].shape == (2,2):
                     f.write("\nTENSORS %s float\n" % key) 
                     for v in vals:
-                        f.write("%f %f %f %f %f %f %f %f %f\n" % (v[0,0],v[0,1],v[0,2],
-                                                                  v[1,0],v[1,1],v[1,2],
-                                                                  v[2,0],v[2,1],v[2,2]))
+                        f.write("%f %f %f %f %f %f %f %f %f\n" % (v[0,0],v[0,1],0,
+                                                                  v[1,0],v[1,1],0,
+                                                                  0,0,0))
         
         #write cell attributes
         f.write("\nCELL_DATA %d" % len(self.G.edges))
@@ -746,13 +752,13 @@ class RiceBall:
                     f.write("\nVECTORS %s float\n" % key) 
                     for v in vals:
                         f.write("%f %f %f\t" % (v[0],v[1],v[2]))
-                #3D Tensor
-                if vals[0].shape == (3,3):
+                #2D Tensor (padded with zeros to become 3D)
+                if vals[0].shape == (2,2):
                     f.write("\nTENSORS %s float\n" % key) 
                     for v in vals:
-                        f.write("%f %f %f %f %f %f %f %f %f\n" % (v[0,0],v[0,1],v[0,2],
-                                                                  v[1,0],v[1,1],v[1,2],
-                                                                  v[2,0],v[2,1],v[2,2]))
+                        f.write("%f %f %f %f %f %f %f %f %f\n" % (v[0,0],v[0,1],0,
+                                                                  v[1,0],v[1,1],0,
+                                                                            0,0,0))
         f.close()
                               
     """
@@ -871,7 +877,7 @@ class RiceBall:
         - ignoreFixed = True if only dynamic (i.e. non-fixed) particles should be plotted. Default is True as stress tensors for
                         fixed particles will be incorrect. 
         - title = the title of the plot. 
-        - label = the label of the colour bar. 
+        - label = the label of the colour bar.  
     **Returns**:
      - fig, ax = the figure that has been plotted.
     """
@@ -885,6 +891,7 @@ class RiceBall:
         vmin = kwds.get("vmin",None)
         vmax = kwds.get("vmax",None)
         func = kwds.get("func","mag")
+        log = kwds.get("log",False)
         #convert keywords to lists as necessary (such that there is a value per plot)
         if isinstance(attr,str):
             attr = [attr]
@@ -1000,7 +1007,7 @@ class RiceBall:
                             scalar.append( A[0,1] )
                         elif "yx" in f:
                             scalar.append( A[1,0] )
-
+            
             #build norm object
             if len(scalar) > 0:
                 if vmin[pn] is None:
@@ -1051,7 +1058,6 @@ class RiceBall:
         fig.tight_layout()
         fig.show()
         return fig,ax
-    
     
     """
     Plot a histogram showing the net particle accelerations (net forces / particle mass).
