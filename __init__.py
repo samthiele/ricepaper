@@ -125,7 +125,7 @@ class RicePaper:
             os.chdir(self.cwd) #restore working directory
             
         self.clear() #clear lines that have now been run
-        self.restart = "state_%d.sav" % self.file #store link to restart file
+        self.restart = "STATE_%d.SAV" % self.file #store link to restart file
 
         #print time
         if printTiming and not suppress:
@@ -224,7 +224,7 @@ class RicePaper:
     Loads the last output file created the last time execute() was run. 
     """
     def loadLastOutput(self):
-        fname = os.path.join(self.dir,"Step%03d.out" % self.file) #calculate filename
+        fname = os.path.join(self.dir,"STEP%03d.OUT" % self.file) #calculate filename
         assert os.path.exists(fname), "Error: no ouput file %s found" % fname
         model = RiceBall(fname,radii=self.radii,density=self.density)
         return model
@@ -246,7 +246,7 @@ class RicePaper:
             steps = list(range( len(self.step)) )
         
         for s in steps:
-            fname = os.path.join(self.dir,"Step%03d.out" % s)
+            fname = os.path.join(self.dir,"STEP%03d.OUT" % s)
             assert os.path.exists(fname), "Error: no ouput file %s found" % fname
             out.append(RiceBall(fname,radii=self.radii,density=self.density))
 
